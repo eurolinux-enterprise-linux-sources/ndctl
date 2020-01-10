@@ -1,0 +1,11 @@
+--- ndctl-56.vanilla/Documentation/ndctl-create-namespace.txt	2017-03-26 16:15:46.619381006 -0400
++++ ndctl-56/Documentation/ndctl-create-namespace.txt	2017-05-24 15:03:41.711314927 -0400
+@@ -93,7 +93,7 @@ OPTIONS
+ 	Applications that want to establish DAX memory mappings
+ 	with page table entries greater than 4K in size need a
+ 	persistent memory namespace that is sufficiently aligned. For
+-	"memory" and "dax" mode this defaults to 2M. Note that "dax"
++	"memory" and "dax" mode this defaults to 4K. Note that "dax"
+ 	mode enforces all mappings to be aligned to this value,
+ 	i.e. fails unaligned mapping attempts.
+ 

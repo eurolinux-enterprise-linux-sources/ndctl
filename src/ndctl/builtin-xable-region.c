@@ -6,11 +6,16 @@
 #include <util/parse-options.h>
 #include <ndctl/libndctl.h>
 
-static const char *region_bus;
+static struct {
+	const char *bus;
+	const char *type;
+} param;
 
 static const struct option region_options[] = {
-	OPT_STRING('b', "bus", &region_bus, "bus-id",
+	OPT_STRING('b', "bus", &param.bus, "bus-id",
 			"<region> must be on a bus with an id/provider of <bus-id>"),
+	OPT_STRING('t', "type", &param.type, "region-type",
+			"<region> must be of the specified type"),
 	OPT_END(),
 };
 
@@ -33,29 +38,42 @@ static const char *parse_region_options(int argc, const char **argv,
 		usage_with_options(u, region_options);
 		return NULL; /* we won't return from usage_with_options() */
 	}
+
+	if (param.type) {
+		if (strcmp(param.type, "pmem") == 0)
+			/* pass */;
+		else if (strcmp(param.type, "blk") == 0)
+			/* pass */;
+		else {
+			error("unknown region type '%s', should be 'pmem' or 'blk'\n",
+					param.type);
+			usage_with_options(u, region_options);
+			return NULL;
+		}
+	}
+
 	return argv[0];
 }
 
 static int do_xable_region(const char *region_arg,
-		int (*xable_fn)(struct ndctl_region *))
+		int (*xable_fn)(struct ndctl_region *), struct ndctl_ctx *ctx)
 {
 	int rc = -ENXIO, success = 0;
 	struct ndctl_region *region;
-	struct ndctl_ctx *ctx;
 	struct ndctl_bus *bus;
 
 	if (!region_arg)
 		goto out;
 
-	rc = ndctl_new(&ctx);
-	if (rc < 0)
-		goto out;
-
         ndctl_bus_foreach(ctx, bus) {
-		if (!util_bus_filter(bus, region_bus))
+		if (!util_bus_filter(bus, param.bus))
 			continue;
 
 		ndctl_region_foreach(bus, region) {
+			const char *type = ndctl_region_get_type_name(region);
+
+			if (param.type && strcmp(param.type, type) != 0)
+				continue;
 			if (!util_region_filter(region, region_arg))
 				continue;
 			if (xable_fn(region) == 0)
@@ -64,17 +82,17 @@ static int do_xable_region(const char *region_arg,
 	}
 
 	rc = success;
-	ndctl_unref(ctx);
  out:
-	region_bus = NULL;
+	param.bus = NULL;
 	return rc;
 }
 
-int cmd_disable_region(int argc, const char **argv)
+int cmd_disable_region(int argc, const char **argv, void *ctx)
 {
 	char *xable_usage = "ndctl disable-region <region> [<options>]";
 	const char *region = parse_region_options(argc, argv, xable_usage);
-	int disabled = do_xable_region(region, ndctl_region_disable_invalidate);
+	int disabled = do_xable_region(region, ndctl_region_disable_invalidate,
+			ctx);
 
 	if (disabled < 0) {
 		fprintf(stderr, "error disabling regions: %s\n",
@@ -90,11 +108,11 @@ int cmd_disable_region(int argc, const char **argv)
 	}
 }
 
-int cmd_enable_region(int argc, const char **argv)
+int cmd_enable_region(int argc, const char **argv, void *ctx)
 {
 	char *xable_usage = "ndctl enable-region <region> [<options>]";
 	const char *region = parse_region_options(argc, argv, xable_usage);
-	int enabled = do_xable_region(region, ndctl_region_enable);
+	int enabled = do_xable_region(region, ndctl_region_enable, ctx);
 
 	if (enabled < 0) {
 		fprintf(stderr, "error enabling regions: %s\n",

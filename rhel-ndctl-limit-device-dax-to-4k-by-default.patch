@@ -1,0 +1,13 @@
+diff -upr ndctl-56.vanilla/ndctl/builtin-xaction-namespace.c ndctl-56/ndctl/builtin-xaction-namespace.c
+--- ndctl-56.vanilla/ndctl/builtin-xaction-namespace.c	2017-03-26 16:15:54.957274589 -0400
++++ ndctl-56/ndctl/builtin-xaction-namespace.c	2017-03-26 16:16:32.671793238 -0400
+@@ -213,7 +213,7 @@ static int set_defaults(enum namespace_a
+ 				param.align);
+ 		rc = -EINVAL;
+ 	} else if (!param.align) {
+-		param.align = "2M";
++		param.align = "4K";
+ 		param.align_default = true;
+ 	}
+ 
+Only in ndctl-56/ndctl: builtin-xaction-namespace.c.orig

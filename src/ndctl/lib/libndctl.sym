@@ -12,6 +12,8 @@ global:
 	ndctl_set_log_priority;
 	ndctl_new;
 	ndctl_get_daxctl_ctx;
+	ndctl_set_private_data;
+	ndctl_get_private_data;
 	ndctl_invalidate;
 local:
         *;
@@ -62,6 +64,7 @@ global:
 	ndctl_dimm_failed_restore;
 	ndctl_dimm_smart_pending;
 	ndctl_dimm_failed_flush;
+	ndctl_dimm_get_health_eventfd;
 	ndctl_dimm_is_cmd_supported;
 	ndctl_dimm_handle_get_node;
 	ndctl_dimm_handle_get_socket;
@@ -209,6 +212,7 @@ global:
 	ndctl_btt_is_configured;
 	ndctl_cmd_cfg_size_get_size;
 	ndctl_cmd_cfg_read_get_data;
+	ndctl_cmd_cfg_read_get_size;
 	ndctl_cmd_cfg_write_set_data;
 	ndctl_cmd_cfg_write_zero_data;
 	ndctl_cmd_unref;
@@ -229,6 +233,7 @@ global:
 	ndctl_pfn_get_align;
 	ndctl_pfn_get_size;
 	ndctl_pfn_get_resource;
+	ndctl_pfn_has_align;
 	ndctl_pfn_set_align;
 	ndctl_pfn_set_namespace;
 	ndctl_pfn_get_bus;
@@ -254,6 +259,7 @@ global:
 	ndctl_dax_get_location;
 	ndctl_dax_set_location;
 	ndctl_dax_get_align;
+	ndctl_dax_has_align;
 	ndctl_dax_set_align;
 	ndctl_dax_set_namespace;
 	ndctl_dax_get_bus;

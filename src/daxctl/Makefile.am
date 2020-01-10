@@ -1,27 +1,13 @@
 include $(top_srcdir)/Makefile.am.in
 
-%.pc: %.pc.in Makefile
-	$(SED_PROCESS)
+bin_PROGRAMS = daxctl
 
-lib_LTLIBRARIES = lib/libdaxctl.la
+daxctl_SOURCES =\
+		daxctl.c \
+		list.c \
+		../util/json.c
 
-lib_libdaxctl_la_SOURCES =\
-	libdaxctl.h \
-	lib/libdaxctl-private.h \
-	../util/sysfs.c \
-	../util/sysfs.h \
-	../util/log.c \
-	../util/log.h \
-	lib/libdaxctl.c
-
-EXTRA_DIST += lib/libdaxctl.sym
-
-lib_libdaxctl_la_LDFLAGS = $(AM_LDFLAGS) \
-	-version-info $(LIBDAXCTL_CURRENT):$(LIBDAXCTL_REVISION):$(LIBDAXCTL_AGE) \
-	-Wl,--version-script=$(top_srcdir)/daxctl/lib/libdaxctl.sym
-lib_libdaxctl_la_DEPENDENCIES = lib/libdaxctl.sym
-
-pkgconfigdir = $(libdir)/pkgconfig
-pkgconfig_DATA = lib/libdaxctl.pc
-EXTRA_DIST += lib/libdaxctl.pc.in
-CLEANFILES += lib/libdaxctl.pc
+daxctl_LDADD =\
+	lib/libdaxctl.la \
+	../libutil.a \
+	$(JSON_LIBS)

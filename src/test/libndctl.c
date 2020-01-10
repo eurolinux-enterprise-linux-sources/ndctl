@@ -21,8 +21,11 @@
 #include <limits.h>
 #include <syslog.h>
 #include <libkmod.h>
+#include <sys/wait.h>
 #include <uuid/uuid.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <linux/version.h>
 
 #include <ccan/array_size/array_size.h>
@@ -95,7 +98,6 @@
  *    dimm.
  */
 
-static const char *NFIT_TEST_MODULE = "nfit_test";
 static const char *NFIT_PROVIDER0 = "nfit_test.0";
 static const char *NFIT_PROVIDER1 = "nfit_test.1";
 #define SZ_4K   0x00001000
@@ -622,10 +624,13 @@ static int validate_dax(struct ndctl_dax *dax)
 	struct ndctl_namespace *ndns = ndctl_dax_get_namespace(dax);
 	const char *devname = ndctl_namespace_get_devname(ndns);
 	struct ndctl_region *region = ndctl_dax_get_region(dax);
-	struct daxctl_region *dax_region = NULL;
+	struct ndctl_ctx *ctx = ndctl_dax_get_ctx(dax);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
+	struct daxctl_region *dax_region = NULL, *found;
+	int rc = -ENXIO, fd, count, dax_expect;
+	struct daxctl_dev *dax_dev, *seed;
+	struct daxctl_ctx *dax_ctx;
 	uuid_t uuid, region_uuid;
-	struct daxctl_dev *dax_dev;
-	int rc = -ENXIO, fd, count;
 	char devpath[50];
 
 	dax_region = ndctl_dax_get_daxctl_region(dax);
@@ -633,6 +638,35 @@ static int validate_dax(struct ndctl_dax *dax)
 		fprintf(stderr, "%s: failed to retrieve daxctl_region\n",
 				devname);
 		return -ENXIO;
+	}
+
+	dax_ctx = ndctl_get_daxctl_ctx(ctx);
+	count = 0;
+	daxctl_region_foreach(dax_ctx, found)
+		if (found == dax_region)
+			count++;
+	if (count != 1) {
+		fprintf(stderr, "%s: failed to iterate to single region instance\n",
+				devname);
+		return -ENXIO;
+	}
+
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 10, 0))) {
+		if (daxctl_region_get_size(dax_region)
+				!= ndctl_dax_get_size(dax)) {
+			fprintf(stderr, "%s: expect size: %llu != %llu\n",
+					devname, ndctl_dax_get_size(dax),
+					daxctl_region_get_size(dax_region));
+			return -ENXIO;
+		}
+
+		if (daxctl_region_get_align(dax_region)
+				!= ndctl_dax_get_align(dax)) {
+			fprintf(stderr, "%s: expect align: %lu != %lu\n",
+					devname, ndctl_dax_get_align(dax),
+					daxctl_region_get_align(dax_region));
+			return -ENXIO;
+		}
 	}
 
 	rc = -ENXIO;
@@ -663,7 +697,8 @@ static int validate_dax(struct ndctl_dax *dax)
 		goto out;
 	}
 
-	if (daxctl_dev_get_size(dax_dev) <= 0) {
+	seed = daxctl_region_get_dev_seed(dax_region);
+	if (dax_dev != seed && daxctl_dev_get_size(dax_dev) <= 0) {
 		fprintf(stderr, "%s: expected non-zero sized dax device\n",
 				devname);
 		goto out;
@@ -680,9 +715,11 @@ static int validate_dax(struct ndctl_dax *dax)
 	count = 0;
 	daxctl_dev_foreach(dax_region, dax_dev)
 		count++;
-	if (count != 1) {
-		fprintf(stderr, "%s: expected 1 dax device, got %d\n",
-				devname, count);
+	dax_expect = seed ? 2 : 1;
+	if (count != dax_expect) {
+		fprintf(stderr, "%s: expected %d dax device%s, got %d\n",
+				devname, dax_expect, dax_expect == 1 ? "" : "s",
+				count);
 		rc = -ENXIO;
 		goto out;
 	}
@@ -931,6 +968,68 @@ static int check_pfn_create(struct ndctl_region *region,
 	return rc;
 }
 
+static int check_btt_size(struct ndctl_btt *btt)
+{
+	struct ndctl_namespace *ndns = ndctl_btt_get_namespace(btt);
+	unsigned long long ns_size = ndctl_namespace_get_size(ndns);
+	unsigned long sect_size = ndctl_btt_get_sector_size(btt);
+	unsigned long long actual, expect;
+	int size_select, sect_select;
+	unsigned long long expect_table[][2] = {
+		[0] = {
+			[0] = 0x11b4400,
+			[1] = 0x8da2000,
+		},
+		[1] = {
+			[0] = 0x13b0400,
+			[1] = 0x9d82000,
+		},
+		[2] = {
+			[0] = 0x1aa2600,
+			[1] = 0xd513000,
+		},
+	};
+
+	if (sect_size >= SZ_4K)
+		sect_select = 1;
+	else if (sect_size >= 512)
+		sect_select = 0;
+	else {
+		fprintf(stderr, "%s: %s unexpected sector size: %lx\n",
+				__func__, ndctl_btt_get_devname(btt),
+				sect_size);
+		return -ENXIO;
+	}
+
+	switch (ns_size) {
+	case SZ_18M:
+		size_select = 0;
+		break;
+	case SZ_20M:
+		size_select = 1;
+		break;
+	case SZ_27M:
+		size_select = 2;
+		break;
+	default:
+		fprintf(stderr, "%s: %s unexpected namespace size: %llx\n",
+				__func__, ndctl_namespace_get_devname(ndns),
+				ns_size);
+		return -ENXIO;
+	}
+
+	expect = expect_table[size_select][sect_select];
+	actual = ndctl_btt_get_size(btt);
+	if (expect != actual) {
+		fprintf(stderr, "%s: namespace: %s unexpected size: %llx (expected: %llx)\n",
+				ndctl_btt_get_devname(btt),
+				ndctl_namespace_get_devname(ndns), actual, expect);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
 static int check_btt_create(struct ndctl_region *region, struct ndctl_namespace *ndns,
 		struct namespace *namespace)
 {
@@ -975,6 +1074,10 @@ static int check_btt_create(struct ndctl_region *region, struct ndctl_namespace 
 		if (mode >= 0 && mode != NDCTL_NS_MODE_SAFE)
 			fprintf(stderr, "%s: expected safe mode got: %d\n",
 					devname, mode);
+
+		rc = check_btt_size(btt);
+		if (rc)
+			goto err;
 
 		if (btt_seed == ndctl_region_get_btt_seed(region)
 				&& btt == btt_seed) {
@@ -1780,6 +1883,7 @@ static int check_btts(struct ndctl_region *region, struct btt **btts)
 struct check_cmd {
 	int (*check_fn)(struct ndctl_bus *bus, struct ndctl_dimm *dimm, struct check_cmd *check);
 	struct ndctl_cmd *cmd;
+	struct ndctl_test *test;
 };
 
 static struct check_cmd *check_cmds;
@@ -2002,12 +2106,44 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		.spares = 5,
 	};
 	struct ndctl_cmd *cmd = ndctl_dimm_cmd_new_smart_threshold(dimm);
-	int rc;
+	struct timeval tm;
+	fd_set fds;
+	int rc, fd;
 
 	if (!cmd) {
 		fprintf(stderr, "%s: dimm: %#x failed to create cmd\n",
 				__func__, ndctl_dimm_get_handle(dimm));
 		return -ENXIO;
+	}
+
+	fd = ndctl_dimm_get_health_eventfd(dimm);
+	FD_ZERO(&fds);
+	tm.tv_sec = 0;
+	tm.tv_usec = 500;
+	rc = select(fd + 1, NULL, NULL, &fds, &tm);
+	if (rc) {
+		fprintf(stderr, "%s: expected health event timeout\n",
+				ndctl_dimm_get_devname(dimm));
+		return -ENXIO;
+	}
+
+	/*
+	 * Starting with v4.9 smart threshold requests trigger the file
+	 * descriptor returned by ndctl_dimm_get_health_eventfd().
+	 */
+	if (ndctl_test_attempt(check->test, KERNEL_VERSION(4, 9, 0))) {
+		int pid = fork();
+
+		if (pid == 0) {
+			FD_ZERO(&fds);
+			FD_SET(fd, &fds);
+			tm.tv_sec = 1;
+			tm.tv_usec = 0;
+			rc = select(fd + 1, NULL, NULL, &fds, &tm);
+			if (rc != 1 || !FD_ISSET(fd, &fds))
+				exit(EXIT_FAILURE);
+			exit(EXIT_SUCCESS);
+		}
 	}
 
 	rc = ndctl_cmd_submit(cmd);
@@ -2016,6 +2152,15 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 			__func__, ndctl_dimm_get_handle(dimm), rc);
 		ndctl_cmd_unref(cmd);
 		return rc;
+	}
+
+	if (ndctl_test_attempt(check->test, KERNEL_VERSION(4, 9, 0))) {
+		wait(&rc);
+		if (WEXITSTATUS(rc) == EXIT_FAILURE) {
+			fprintf(stderr, "%s: expect health event trigger\n",
+					ndctl_dimm_get_devname(dimm));
+			return -ENXIO;
+		}
 	}
 
 	__check_smart_threshold(dimm, cmd, alarm_control);
@@ -2232,12 +2377,15 @@ static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 	 * check_set_config_data can assume that both
 	 * check_get_config_size and check_get_config_data have run
 	 */
-	static struct check_cmd __check_dimm_cmds[] = {
+	struct check_cmd __check_dimm_cmds[] = {
 		[ND_CMD_GET_CONFIG_SIZE] = { check_get_config_size },
 		[ND_CMD_GET_CONFIG_DATA] = { check_get_config_data },
 		[ND_CMD_SET_CONFIG_DATA] = { check_set_config_data },
 		[ND_CMD_SMART] = { check_smart },
-		[ND_CMD_SMART_THRESHOLD] = { check_smart_threshold },
+		[ND_CMD_SMART_THRESHOLD] = {
+			.check_fn = check_smart_threshold,
+			.test = test,
+		},
 	};
 	static struct check_cmd __check_bus_cmds[] = {
 #ifdef HAVE_NDCTL_ARS
@@ -2251,8 +2399,11 @@ static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 	};
 	unsigned int i, rc = 0;
 
-	/* the kernel did not start emulating smart data until 4.7 */
-	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 7, 0)))
+	/*
+	 * The kernel did not start emulating v1.2 namespace spec smart data
+	 * until 4.9.
+	 */
+	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 9, 0)))
 		dimm_commands &= ~((1 << ND_CMD_SMART)
 				| (1 << ND_CMD_SMART_THRESHOLD));
 
@@ -2492,6 +2643,13 @@ static int do_test1(struct ndctl_ctx *ctx, struct ndctl_test *test)
 
 	ndctl_bus_wait_probe(bus);
 
+	/*
+	 * Starting with v4.10 the dimm on nfit_test.1 gets a unique
+	 * handle.
+	 */
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 10, 0)))
+		dimms1[0].handle = DIMM_HANDLE(1, 0, 0, 0, 0);
+
 	rc = check_dimms(bus, dimms1, ARRAY_SIZE(dimms1), 0, 0, test);
 	if (rc)
 		return rc;
@@ -2505,10 +2663,9 @@ static do_test_fn do_test[] = {
 	do_test1,
 };
 
-int test_libndctl(int loglevel, struct ndctl_test *test)
+int test_libndctl(int loglevel, struct ndctl_test *test, struct ndctl_ctx *ctx)
 {
 	unsigned int i;
-	struct ndctl_ctx *ctx;
 	struct kmod_module *mod;
 	struct kmod_ctx *kmod_ctx;
 	struct daxctl_ctx *daxctl_ctx;
@@ -2517,31 +2674,16 @@ int test_libndctl(int loglevel, struct ndctl_test *test)
 	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 2, 0)))
 		return 77;
 
-	err = ndctl_new(&ctx);
-	if (err < 0)
-		exit(EXIT_FAILURE);
-
 	ndctl_set_log_priority(ctx, loglevel);
 	daxctl_ctx = ndctl_get_daxctl_ctx(ctx);
 	daxctl_set_log_priority(daxctl_ctx, loglevel);
+	ndctl_set_private_data(ctx, test);
 
-	kmod_ctx = kmod_new(NULL, NULL);
-	if (!kmod_ctx)
-		goto err_kmod;
-	kmod_set_log_priority(kmod_ctx, loglevel);
-
-	err = kmod_module_new_from_name(kmod_ctx, NFIT_TEST_MODULE, &mod);
-	if (err < 0)
-		goto err_module;
-
-	err = kmod_module_probe_insert_module(mod, KMOD_PROBE_APPLY_BLACKLIST,
-			NULL, NULL, NULL, NULL);
+	err = nfit_test_init(&kmod_ctx, &mod, loglevel);
 	if (err < 0) {
-		result = 77;
 		ndctl_test_skip(test);
-		fprintf(stderr, "%s unavailable skipping tests\n",
-				NFIT_TEST_MODULE);
-		goto err_module;
+		fprintf(stderr, "nfit_test unavailable skipping tests\n");
+		return 77;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(do_test); i++) {
@@ -2555,17 +2697,14 @@ int test_libndctl(int loglevel, struct ndctl_test *test)
 	if (i >= ARRAY_SIZE(do_test))
 		result = EXIT_SUCCESS;
 	kmod_module_remove_module(mod, 0);
-
- err_module:
 	kmod_unref(kmod_ctx);
- err_kmod:
-	ndctl_unref(ctx);
 	return result;
 }
 
 int __attribute__((weak)) main(int argc, char *argv[])
 {
 	struct ndctl_test *test = ndctl_test_new(0);
+	struct ndctl_ctx *ctx;
 	int rc;
 
 	if (!test) {
@@ -2573,6 +2712,10 @@ int __attribute__((weak)) main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	rc = test_libndctl(LOG_DEBUG, test);
+	rc = ndctl_new(&ctx);
+	if (rc)
+		return ndctl_test_result(test, rc);
+	rc = test_libndctl(LOG_DEBUG, test, ctx);
+	ndctl_unref(ctx);
 	return ndctl_test_result(test, rc);
 }

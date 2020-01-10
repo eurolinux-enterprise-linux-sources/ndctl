@@ -23,6 +23,7 @@ static struct {
 	bool namespaces;
 	bool idle;
 	bool health;
+	bool dax;
 } list;
 
 static struct {
@@ -30,6 +31,7 @@ static struct {
 	const char *region;
 	const char *type;
 	const char *dimm;
+	const char *mode;
 	const char *namespace;
 } param;
 
@@ -43,6 +45,25 @@ do { \
 			VERSION, __func__, __LINE__, ##__VA_ARGS__); \
 } while (0)
 
+static enum ndctl_namespace_mode mode_to_type(const char *mode)
+{
+	if (!mode)
+		return -ENXIO;
+
+	if (strcasecmp(param.mode, "memory") == 0)
+		return NDCTL_NS_MODE_MEMORY;
+	else if (strcasecmp(param.mode, "sector") == 0)
+		return NDCTL_NS_MODE_SAFE;
+	else if (strcasecmp(param.mode, "safe") == 0)
+		return NDCTL_NS_MODE_SAFE;
+	else if (strcasecmp(param.mode, "dax") == 0)
+		return NDCTL_NS_MODE_DAX;
+	else if (strcasecmp(param.mode, "raw") == 0)
+		return NDCTL_NS_MODE_RAW;
+
+	return NDCTL_NS_MODE_UNKNOWN;
+}
+
 static struct json_object *list_namespaces(struct ndctl_region *region,
 		struct json_object *container, struct json_object *jnamespaces,
 		bool continue_array)
@@ -50,6 +71,7 @@ static struct json_object *list_namespaces(struct ndctl_region *region,
 	struct ndctl_namespace *ndns;
 
 	ndctl_namespace_foreach(region, ndns) {
+		enum ndctl_namespace_mode mode = ndctl_namespace_get_mode(ndns);
 		struct json_object *jndns;
 
 		/* are we emitting namespaces? */
@@ -57,6 +79,9 @@ static struct json_object *list_namespaces(struct ndctl_region *region,
 			break;
 
 		if (!util_namespace_filter(ndns, param.namespace))
+			continue;
+
+		if (param.mode && mode_to_type(param.mode) != mode)
 			continue;
 
 		if (!list.idle && !util_namespace_active(ndns))
@@ -74,7 +99,7 @@ static struct json_object *list_namespaces(struct ndctl_region *region,
 						jnamespaces);
 		}
 
-		jndns = util_namespace_to_json(ndns, list.idle);
+		jndns = util_namespace_to_json(ndns, list.idle, list.dax);
 		if (!jndns) {
 			fail("\n");
 			continue;
@@ -148,6 +173,9 @@ static struct json_object *region_to_json(struct ndctl_region *region)
 		if (!list.dimms)
 			break;
 
+		if (!util_dimm_filter(dimm, param.dimm))
+			continue;
+
 		if (!list.idle && !ndctl_dimm_is_enabled(dimm))
 			continue;
 
@@ -188,7 +216,7 @@ static int num_list_flags(void)
 	return list.buses + list.dimms + list.regions + list.namespaces;
 }
 
-int cmd_list(int argc, const char **argv)
+int cmd_list(int argc, const char **argv, void *ctx)
 {
 	const struct option options[] = {
 		OPT_STRING('b', "bus", &param.bus, "bus-id", "filter by bus"),
@@ -197,7 +225,9 @@ int cmd_list(int argc, const char **argv)
 		OPT_STRING('d', "dimm", &param.dimm, "dimm-id",
 				"filter by dimm"),
 		OPT_STRING('n', "namespace", &param.namespace, "namespace-id",
-				"filter by namespace"),
+				"filter by namespace id"),
+		OPT_STRING('m', "mode", &param.mode, "namespace-mode",
+				"filter by namespace mode"),
 		OPT_STRING('t', "type", &param.type, "region-type",
 				"filter by region-type"),
 		OPT_BOOLEAN('B', "buses", &list.buses, "include bus info"),
@@ -207,6 +237,8 @@ int cmd_list(int argc, const char **argv)
 				"include region info"),
 		OPT_BOOLEAN('N', "namespaces", &list.namespaces,
 				"include namespace info (default)"),
+		OPT_BOOLEAN('X', "device-dax", &list.dax,
+				"include device-dax info"),
 		OPT_BOOLEAN('i', "idle", &list.idle, "include idle devices"),
 		OPT_END(),
 	};
@@ -218,10 +250,9 @@ int cmd_list(int argc, const char **argv)
 	struct json_object *jregions = NULL;
 	struct json_object *jdimms = NULL;
 	struct json_object *jbuses = NULL;
-	struct ndctl_ctx *ctx;
 	struct ndctl_bus *bus;
 	unsigned int type = 0;
-	int i, rc;
+	int i;
 
         argc = parse_options(argc, argv, options, u, 0);
 	for (i = 0; i < argc; i++)
@@ -240,6 +271,8 @@ int cmd_list(int argc, const char **argv)
 		list.buses = !!param.bus;
 		list.regions = !!param.region;
 		list.dimms = !!param.dimm;
+		if (list.dax && !param.mode)
+			param.mode = "dax";
 	}
 
 	if (num_list_flags() == 0)
@@ -252,9 +285,10 @@ int cmd_list(int argc, const char **argv)
 			type = ND_DEVICE_REGION_BLK;
 	}
 
-	rc = ndctl_new(&ctx);
-	if (rc < 0)
-		return rc;
+	if (mode_to_type(param.mode) == NDCTL_NS_MODE_UNKNOWN) {
+		error("invalid mode: '%s'\n", param.mode);
+		return -EINVAL;
+	}
 
 	ndctl_bus_foreach(ctx, bus) {
 		struct json_object *jbus = NULL;

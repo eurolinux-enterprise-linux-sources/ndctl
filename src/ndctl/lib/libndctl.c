@@ -125,6 +125,7 @@ struct ndctl_bus {
 struct ndctl_dimm {
 	struct kmod_module *module;
 	struct ndctl_bus *bus;
+	struct ndctl_smart_ops *smart_ops;
 	unsigned int handle, major, minor, serial;
 	unsigned short phys_id;
 	unsigned short vendor_id;
@@ -135,10 +136,12 @@ struct ndctl_dimm {
 	unsigned short subsystem_revision_id;
 	unsigned short manufacturing_date;
 	unsigned char manufacturing_location;
+	unsigned long dsm_family;
 	unsigned long dsm_mask;
 	char *unique_id;
 	char *dimm_path;
 	char *dimm_buf;
+	int health_eventfd;
 	int buf_len;
 	int id;
 	union {
@@ -431,6 +434,16 @@ NDCTL_EXPORT int ndctl_new(struct ndctl_ctx **ctx)
 	return rc;
 }
 
+NDCTL_EXPORT void ndctl_set_private_data(struct ndctl_ctx *ctx, void *data)
+{
+	ctx->private_data = data;
+}
+
+NDCTL_EXPORT void *ndctl_get_private_data(struct ndctl_ctx *ctx)
+{
+	return ctx->private_data;
+}
+
 NDCTL_EXPORT struct daxctl_ctx *ndctl_get_daxctl_ctx(struct ndctl_ctx *ctx)
 {
 	return ctx->daxctl_ctx;
@@ -591,6 +604,8 @@ static void free_dimm(struct ndctl_dimm *dimm)
 	free(dimm->dimm_path);
 	if (dimm->module)
 		kmod_module_unref(dimm->module);
+	if (dimm->health_eventfd > -1)
+		close(dimm->health_eventfd);
 	free(dimm);
 }
 
@@ -717,7 +732,7 @@ static int to_dsm_index(const char *name, int dimm)
 	int i, end_cmd;
 
 	if (dimm) {
-		end_cmd = ND_CMD_VENDOR;
+		end_cmd = ND_CMD_CALL;
 		cmd_name_fn = nvdimm_cmd_name;
 	} else {
 		end_cmd = nd_cmd_clear_error;
@@ -779,16 +794,15 @@ static void parse_nfit_mem_flags(struct ndctl_dimm *dimm, char *flags)
 				ndctl_dimm_get_devname(dimm), flags);
 }
 
-static int add_bus(void *parent, int id, const char *ctl_base)
+static void *add_bus(void *parent, int id, const char *ctl_base)
 {
-	int rc = -ENOMEM;
 	char buf[SYSFS_ATTR_SIZE];
 	struct ndctl_ctx *ctx = parent;
 	struct ndctl_bus *bus, *bus_dup;
 	char *path = calloc(1, strlen(ctl_base) + 100);
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	bus = calloc(1, sizeof(*bus));
 	if (!bus)
@@ -798,7 +812,6 @@ static int add_bus(void *parent, int id, const char *ctl_base)
 	bus->ctx = ctx;
 	bus->id = id;
 
-	rc = -EINVAL;
 	sprintf(path, "%s/dev", ctl_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0
 			|| sscanf(buf, "%d:%d", &bus->major, &bus->minor) != 2)
@@ -822,7 +835,6 @@ static int add_bus(void *parent, int id, const char *ctl_base)
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
 
-	rc = -ENOMEM;
 	bus->provider = strdup(buf);
 	if (!bus->provider)
 		goto err_read;
@@ -846,24 +858,23 @@ static int add_bus(void *parent, int id, const char *ctl_base)
 					ndctl_bus_get_provider(bus)) == 0) {
 			free_bus(bus, NULL);
 			free(path);
-			return 1;
+			return bus_dup;
 		}
 
 	list_add(&ctx->busses, &bus->list);
+	free(path);
 
-	rc = 0;
-	goto out;
+	return bus;
 
  err_dev_path:
  err_read:
 	free(bus->provider);
 	free(bus->bus_buf);
 	free(bus);
- out:
  err_bus:
 	free(path);
 
-	return rc;
+	return NULL;
 }
 
 static void busses_init(struct ndctl_ctx *ctx)
@@ -1112,17 +1123,17 @@ static int ndctl_bind(struct ndctl_ctx *ctx, struct kmod_module *module,
 static int ndctl_unbind(struct ndctl_ctx *ctx, const char *devpath);
 static struct kmod_module *to_module(struct ndctl_ctx *ctx, const char *alias);
 
-static int add_dimm(void *parent, int id, const char *dimm_base)
+static void *add_dimm(void *parent, int id, const char *dimm_base)
 {
+	int formats, i;
 	struct ndctl_dimm *dimm;
 	char buf[SYSFS_ATTR_SIZE];
-	int rc = -ENOMEM, formats, i;
 	struct ndctl_bus *bus = parent;
 	struct ndctl_ctx *ctx = bus->ctx;
 	char *path = calloc(1, strlen(dimm_base) + 100);
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	sprintf(path, "%s/nfit/formats", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
@@ -1136,8 +1147,6 @@ static int add_dimm(void *parent, int id, const char *dimm_base)
 	dimm->bus = bus;
 	dimm->id = id;
 
-	rc = -ENXIO;
-
 	sprintf(path, "%s/dev", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
@@ -1149,10 +1158,10 @@ static int add_dimm(void *parent, int id, const char *dimm_base)
 		goto err_read;
 	dimm->dsm_mask = parse_commands(buf, 1);
 
-        dimm->dimm_buf = calloc(1, strlen(dimm_base) + 50);
-        if (!dimm->dimm_buf)
-                goto err_read;
-        dimm->buf_len = strlen(dimm_base) + 50;
+	dimm->dimm_buf = calloc(1, strlen(dimm_base) + 50);
+	if (!dimm->dimm_buf)
+		goto err_read;
+	dimm->buf_len = strlen(dimm_base) + 50;
 
 	dimm->dimm_path = strdup(dimm_base);
 	if (!dimm->dimm_path)
@@ -1163,17 +1172,20 @@ static int add_dimm(void *parent, int id, const char *dimm_base)
 		goto err_read;
 	dimm->module = to_module(ctx, buf);
 
+	dimm->smart_ops = intel_smart_ops;
 	dimm->handle = -1;
 	dimm->phys_id = -1;
 	dimm->serial = -1;
 	dimm->vendor_id = -1;
 	dimm->device_id = -1;
 	dimm->revision_id = -1;
+	dimm->health_eventfd = -1;
 	dimm->subsystem_vendor_id = -1;
 	dimm->subsystem_device_id = -1;
 	dimm->subsystem_revision_id = -1;
 	dimm->manufacturing_date = -1;
 	dimm->manufacturing_location = -1;
+	dimm->dsm_family = -1;
 	for (i = 0; i < formats; i++)
 		dimm->format[i] = -1;
 
@@ -1237,6 +1249,12 @@ static int add_dimm(void *parent, int id, const char *dimm_base)
 	if (sysfs_read_attr(ctx, path, buf) == 0)
 		dimm->subsystem_revision_id = strtoul(buf, NULL, 0);
 
+	sprintf(path, "%s/nfit/family", dimm_base);
+	if (sysfs_read_attr(ctx, path, buf) == 0)
+		dimm->dsm_family = strtoul(buf, NULL, 0);
+	if (dimm->dsm_family == NVDIMM_FAMILY_HPE1)
+		dimm->smart_ops = hpe1_smart_ops;
+
 	dimm->formats = formats;
 	sprintf(path, "%s/nfit/format", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
@@ -1250,17 +1268,19 @@ static int add_dimm(void *parent, int id, const char *dimm_base)
 	sprintf(path, "%s/nfit/flags", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
 		parse_nfit_mem_flags(dimm, buf);
+
+	dimm->health_eventfd = open(path, O_RDONLY|O_CLOEXEC);
  out:
 	list_add(&bus->dimms, &dimm->list);
 	free(path);
 
-	return 0;
+	return dimm;
 
  err_read:
 	free_dimm(dimm);
  err_dimm:
 	free(path);
-	return rc;
+	return NULL;
 }
 
 static void dimms_init(struct ndctl_bus *bus)
@@ -1429,6 +1449,11 @@ NDCTL_EXPORT int ndctl_dimm_is_cmd_supported(struct ndctl_dimm *dimm,
 	return !!(dimm->dsm_mask & (1ULL << cmd));
 }
 
+NDCTL_EXPORT int ndctl_dimm_get_health_eventfd(struct ndctl_dimm *dimm)
+{
+	return dimm->health_eventfd;
+}
+
 NDCTL_EXPORT unsigned int ndctl_dimm_handle_get_node(struct ndctl_dimm *dimm)
 {
 	return dimm->handle >> 16 & 0xfff;
@@ -1457,6 +1482,11 @@ NDCTL_EXPORT unsigned int ndctl_dimm_handle_get_dimm(struct ndctl_dimm *dimm)
 NDCTL_EXPORT struct ndctl_bus *ndctl_dimm_get_bus(struct ndctl_dimm *dimm)
 {
 	return dimm->bus;
+}
+
+NDCTL_EXPORT struct ndctl_smart_ops *ndctl_dimm_get_smart_ops(struct ndctl_dimm *dimm)
+{
+	return dimm->smart_ops;
 }
 
 NDCTL_EXPORT struct ndctl_ctx *ndctl_dimm_get_ctx(struct ndctl_dimm *dimm)
@@ -1525,9 +1555,8 @@ static struct ndctl_dimm *ndctl_dimm_get_by_id(struct ndctl_bus *bus, unsigned i
 	return NULL;
 }
 
-static int add_region(void *parent, int id, const char *region_base)
+static void *add_region(void *parent, int id, const char *region_base)
 {
-	int rc = -ENOMEM;
 	char buf[SYSFS_ATTR_SIZE];
 	struct ndctl_region *region;
 	struct ndctl_bus *bus = parent;
@@ -1535,7 +1564,7 @@ static int add_region(void *parent, int id, const char *region_base)
 	char *path = calloc(1, strlen(region_base) + 100);
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	region = calloc(1, sizeof(*region));
 	if (!region)
@@ -1552,7 +1581,6 @@ static int add_region(void *parent, int id, const char *region_base)
 	region->bus = bus;
 	region->id = id;
 
-	rc = -EINVAL;
 	sprintf(path, "%s/size", region_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
@@ -1607,7 +1635,7 @@ static int add_region(void *parent, int id, const char *region_base)
 	list_add(&bus->regions, &region->list);
 
 	free(path);
-	return 0;
+	return region;
 
  err_read:
 	free(region->region_buf);
@@ -1615,7 +1643,7 @@ static int add_region(void *parent, int id, const char *region_base)
  err_region:
 	free(path);
 
-	return rc;
+	return NULL;
 }
 
 static void regions_init(struct ndctl_bus *bus)
@@ -1648,7 +1676,7 @@ NDCTL_EXPORT unsigned int ndctl_region_get_id(struct ndctl_region *region)
 
 NDCTL_EXPORT unsigned int ndctl_region_get_interleave_ways(struct ndctl_region *region)
 {
-	return ndctl_region_get_mappings(region);
+	return max(1U, ndctl_region_get_mappings(region));
 }
 
 NDCTL_EXPORT unsigned int ndctl_region_get_mappings(struct ndctl_region *region)
@@ -1681,11 +1709,11 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_available_size(
 	if (snprintf(path, len, "%s/available_size", region->region_path) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				ndctl_region_get_devname(region));
-		return -ENOMEM;
+		return ULLONG_MAX;
 	}
 
 	if (sysfs_read_attr(ctx, path, buf) < 0)
-		return -ENXIO;
+		return ULLONG_MAX;
 
 	return strtoull(buf, NULL, 0);
 }
@@ -1942,6 +1970,7 @@ NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_cfg_read(struct ndctl_cmd *cfg
 	cmd->get_data->in_length = cfg_size->get_size->max_xfer;
 	cmd->firmware_status = &cmd->get_data->status;
 	cmd->iter.offset = &cmd->get_data->in_offset;
+	cmd->iter.xfer = &cmd->get_data->in_length;
 	cmd->iter.max_xfer = cfg_size->get_size->max_xfer;
 	cmd->iter.data = cmd->get_data->out_buf;
 	cmd->iter.total_xfer = cfg_size->get_size->config_size;
@@ -1995,6 +2024,7 @@ NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_cfg_write(struct ndctl_cmd *cf
 	cmd->firmware_status = (u32 *) (cmd->cmd_buf
 		+ sizeof(struct nd_cmd_set_config_hdr) + cfg_read->iter.max_xfer);
 	cmd->iter.offset = &cmd->set_data->in_offset;
+	cmd->iter.xfer = &cmd->set_data->in_length;
 	cmd->iter.max_xfer = cfg_read->iter.max_xfer;
 	cmd->iter.data = cmd->set_data->in_buf;
 	cmd->iter.total_xfer = cfg_read->iter.total_xfer;
@@ -2027,6 +2057,15 @@ NDCTL_EXPORT ssize_t ndctl_cmd_cfg_read_get_data(struct ndctl_cmd *cfg_read,
 		len = cfg_read->iter.total_xfer - offset;
 	memcpy(buf, cfg_read->iter.total_buf + offset, len);
 	return len;
+}
+
+NDCTL_EXPORT ssize_t ndctl_cmd_cfg_read_get_size(struct ndctl_cmd *cfg_read)
+{
+	if (cfg_read->type != ND_CMD_GET_CONFIG_DATA || cfg_read->status > 0)
+		return -EINVAL;
+	if (cfg_read->status < 0)
+		return cfg_read->status;
+	return cfg_read->iter.total_xfer;
 }
 
 NDCTL_EXPORT ssize_t ndctl_cmd_cfg_write_set_data(struct ndctl_cmd *cfg_write,
@@ -2170,6 +2209,7 @@ static int to_ioctl_cmd(int cmd, int dimm)
 	case ND_CMD_GET_CONFIG_DATA:        return ND_IOCTL_GET_CONFIG_DATA;
 	case ND_CMD_SET_CONFIG_DATA:        return ND_IOCTL_SET_CONFIG_DATA;
 	case ND_CMD_VENDOR:                 return ND_IOCTL_VENDOR;
+	case ND_CMD_CALL:                   return ND_IOCTL_CALL;
 	case ND_CMD_VENDOR_EFFECT_LOG_SIZE:
 	case ND_CMD_VENDOR_EFFECT_LOG:
 	default:
@@ -2202,19 +2242,21 @@ static int do_cmd(int fd, int ioctl_cmd, struct ndctl_cmd *cmd)
 	}
 
 	for (offset = 0; offset < iter->total_xfer; offset += iter->max_xfer) {
+		*(cmd->iter.xfer) = min(iter->total_xfer - offset,
+				iter->max_xfer);
+		*(cmd->iter.offset) = offset;
 		if (iter->dir == WRITE)
 			memcpy(iter->data, iter->total_buf + offset,
-					iter->max_xfer);
-		*(cmd->iter.offset) = offset;
+					*(cmd->iter.xfer));
 		rc = ioctl(fd, ioctl_cmd, cmd->cmd_buf);
 		if (rc < 0)
 			break;
 
 		if (iter->dir == READ)
 			memcpy(iter->total_buf + offset, iter->data,
-					iter->max_xfer - rc);
+					*(cmd->iter.xfer) - rc);
 		if (*(cmd->firmware_status) || rc) {
-			rc = offset + iter->max_xfer - rc;
+			rc = offset + *(cmd->iter.xfer) - rc;
 			break;
 		}
 	}
@@ -2488,11 +2530,11 @@ NDCTL_EXPORT unsigned long ndctl_dimm_get_available_labels(
 	if (snprintf(path, len, "%s/available_slots", dimm->dimm_path) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				ndctl_dimm_get_devname(dimm));
-		return -ENOMEM;
+		return ULONG_MAX;
 	}
 
 	if (sysfs_read_attr(ctx, path, buf) < 0)
-		return 0;
+		return ULONG_MAX;
 
 	return strtoul(buf, NULL, 0);
 }
@@ -2696,7 +2738,7 @@ static char *get_block_device(struct ndctl_ctx *ctx, const char *block_path)
 static int parse_lbasize_supported(struct ndctl_ctx *ctx, const char *devname,
 		const char *buf, struct ndctl_lbasize *lba);
 
-static int add_namespace(void *parent, int id, const char *ndns_base)
+static void *add_namespace(void *parent, int id, const char *ndns_base)
 {
 	const char *devname = devpath_to_devname(ndns_base);
 	char *path = calloc(1, strlen(ndns_base) + 100);
@@ -2705,10 +2747,9 @@ static int add_namespace(void *parent, int id, const char *ndns_base)
 	struct ndctl_bus *bus = region->bus;
 	struct ndctl_ctx *ctx = bus->ctx;
 	char buf[SYSFS_ATTR_SIZE];
-	int rc = -ENOMEM;
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	ndns = calloc(1, sizeof(*ndns));
 	if (!ndns)
@@ -2739,9 +2780,8 @@ static int add_namespace(void *parent, int id, const char *ndns_base)
 	ndns->raw_mode = strtoul(buf, NULL, 0);
 
 	sprintf(path, "%s/numa_node", ndns_base);
-	if (sysfs_read_attr(ctx, path, buf) < 0)
-		goto err_read;
-	ndns->numa_node = strtol(buf, NULL, 0);
+	if (sysfs_read_attr(ctx, path, buf) == 0)
+		ndns->numa_node = strtol(buf, NULL, 0);
 
 	switch (ndns->type) {
 	case ND_DEVICE_NAMESPACE_BLK:
@@ -2764,7 +2804,6 @@ static int add_namespace(void *parent, int id, const char *ndns_base)
 			goto err_read;
 		if (strlen(buf) && uuid_parse(buf, ndns->uuid) < 0) {
 			dbg(ctx, "%s:%s\n", path, buf);
-			rc = -EINVAL;
 			goto err_read;
 		}
 		break;
@@ -2790,12 +2829,12 @@ static int add_namespace(void *parent, int id, const char *ndns_base)
 		if (ndns_dup->id == ndns->id) {
 			free_namespace(ndns, NULL);
 			free(path);
-			return 1;
+			return ndns_dup;
 		}
 
 	list_add(&region->namespaces, &ndns->list);
 	free(path);
-	return 0;
+	return ndns;
 
  err_read:
 	free(ndns->ndns_buf);
@@ -2804,7 +2843,7 @@ static int add_namespace(void *parent, int id, const char *ndns_base)
 	free(ndns);
  err_namespace:
 	free(path);
-	return rc;
+	return NULL;
 }
 
 static void namespaces_init(struct ndctl_region *region)
@@ -3114,9 +3153,9 @@ static int ndctl_unbind(struct ndctl_ctx *ctx, const char *devpath)
 	return sysfs_write_attr(ctx, path, devname);
 }
 
-static int add_btt(void *parent, int id, const char *btt_base);
-static int add_pfn(void *parent, int id, const char *pfn_base);
-static int add_dax(void *parent, int id, const char *dax_base);
+static void *add_btt(void *parent, int id, const char *btt_base);
+static void *add_pfn(void *parent, int id, const char *pfn_base);
+static void *add_dax(void *parent, int id, const char *dax_base);
 
 static void btts_init(struct ndctl_region *region)
 {
@@ -3570,7 +3609,7 @@ static int parse_lbasize_supported(struct ndctl_ctx *ctx, const char *devname,
 	return -ENXIO;
 }
 
-static int add_btt(void *parent, int id, const char *btt_base)
+static void *add_btt(void *parent, int id, const char *btt_base)
 {
 	struct ndctl_ctx *ctx = ndctl_region_get_ctx(parent);
 	const char *devname = devpath_to_devname(btt_base);
@@ -3578,10 +3617,9 @@ static int add_btt(void *parent, int id, const char *btt_base)
 	struct ndctl_region *region = parent;
 	struct ndctl_btt *btt, *btt_dup;
 	char buf[SYSFS_ATTR_SIZE];
-	int rc = -ENOMEM;
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	btt = calloc(1, sizeof(*btt));
 	if (!btt)
@@ -3607,10 +3645,8 @@ static int add_btt(void *parent, int id, const char *btt_base)
 	sprintf(path, "%s/uuid", btt_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
-	if (strlen(buf) && uuid_parse(buf, btt->uuid) < 0) {
-		rc = -EINVAL;
+	if (strlen(buf) && uuid_parse(buf, btt->uuid) < 0)
 		goto err_read;
-	}
 
 	sprintf(path, "%s/sector_size", btt_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
@@ -3629,11 +3665,11 @@ static int add_btt(void *parent, int id, const char *btt_base)
 		if (btt->id == btt_dup->id) {
 			btt_dup->size = btt->size;
 			free_btt(btt, NULL);
-			return 1;
+			return btt_dup;
 		}
 
 	list_add(&region->btts, &btt->list);
-	return 0;
+	return btt;
 
  err_read:
 	free(btt->lbasize.supported);
@@ -3642,7 +3678,7 @@ static int add_btt(void *parent, int id, const char *btt_base)
 	free(btt);
  err_btt:
 	free(path);
-	return rc;
+	return NULL;
 }
 
 NDCTL_EXPORT struct ndctl_btt *ndctl_btt_get_first(struct ndctl_region *region)
@@ -3927,16 +3963,15 @@ NDCTL_EXPORT int ndctl_btt_is_configured(struct ndctl_btt *btt)
 	return 0;
 }
 
-static int __add_pfn(struct ndctl_pfn *pfn, const char *pfn_base)
+static void *__add_pfn(struct ndctl_pfn *pfn, const char *pfn_base)
 {
 	struct ndctl_ctx *ctx = ndctl_region_get_ctx(pfn->region);
 	char *path = calloc(1, strlen(pfn_base) + 100);
 	struct ndctl_region *region = pfn->region;
 	char buf[SYSFS_ATTR_SIZE];
-	int rc = -ENOMEM;
 
 	if (!path)
-		return -ENOMEM;
+		return NULL;
 
 	pfn->generation = region->generation;
 
@@ -3957,10 +3992,8 @@ static int __add_pfn(struct ndctl_pfn *pfn, const char *pfn_base)
 	sprintf(path, "%s/uuid", pfn_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
-	if (strlen(buf) && uuid_parse(buf, pfn->uuid) < 0) {
-		rc = -EINVAL;
+	if (strlen(buf) && uuid_parse(buf, pfn->uuid) < 0)
 		goto err_read;
-	}
 
 	sprintf(path, "%s/mode", pfn_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
@@ -3993,30 +4026,28 @@ static int __add_pfn(struct ndctl_pfn *pfn, const char *pfn_base)
 		pfn->size = strtoull(buf, NULL, 0);
 
 	free(path);
-	return 0;
+	return pfn;
 
  err_read:
 	free(pfn->pfn_buf);
 	free(pfn->pfn_path);
 	free(path);
-	return rc;
+	return NULL;
 }
 
-static int add_pfn(void *parent, int id, const char *pfn_base)
+static void *add_pfn(void *parent, int id, const char *pfn_base)
 {
 	struct ndctl_pfn *pfn = calloc(1, sizeof(*pfn)), *pfn_dup;
 	struct ndctl_region *region = parent;
-	int rc;
 
 	if (!pfn)
-		return -ENOMEM;
+		return NULL;
 
 	pfn->id = id;
 	pfn->region = region;
-	rc = __add_pfn(pfn, pfn_base);
-	if (rc < 0) {
+	if (!__add_pfn(pfn, pfn_base)) {
 		free(pfn);
-		return rc;
+		return NULL;
 	}
 
 	ndctl_pfn_foreach(region, pfn_dup)
@@ -4024,30 +4055,28 @@ static int add_pfn(void *parent, int id, const char *pfn_base)
 			pfn_dup->resource = pfn->resource;
 			pfn_dup->size = pfn->size;
 			free_pfn(pfn, NULL);
-			return 1;
+			return pfn_dup;
 		}
 
 	list_add(&region->pfns, &pfn->list);
 
-	return 0;
+	return pfn;
 }
 
-static int add_dax(void *parent, int id, const char *dax_base)
+static void *add_dax(void *parent, int id, const char *dax_base)
 {
 	struct ndctl_dax *dax = calloc(1, sizeof(*dax)), *dax_dup;
 	struct ndctl_region *region = parent;
 	struct ndctl_pfn *pfn = &dax->pfn;
-	int rc;
 
 	if (!dax)
-		return -ENOMEM;
+		return NULL;
 
 	pfn->id = id;
 	pfn->region = region;
-	rc = __add_pfn(pfn, dax_base);
-	if (rc < 0) {
+	if (!__add_pfn(pfn, dax_base)) {
 		free(dax);
-		return rc;
+		return NULL;
 	}
 
 	ndctl_dax_foreach(region, dax_dup) {
@@ -4057,13 +4086,13 @@ static int add_dax(void *parent, int id, const char *dax_base)
 			pfn_dup->resource = pfn->resource;
 			pfn_dup->size = pfn->size;
 			free_dax(dax, NULL);
-			return 1;
+			return dax_dup;
 		}
 	}
 
 	list_add(&region->daxs, &dax->pfn.list);
 
-	return 0;
+	return dax;
 }
 
 NDCTL_EXPORT struct ndctl_pfn *ndctl_pfn_get_first(struct ndctl_region *region)
@@ -4189,6 +4218,22 @@ NDCTL_EXPORT int ndctl_pfn_set_location(struct ndctl_pfn *pfn,
 NDCTL_EXPORT unsigned long ndctl_pfn_get_align(struct ndctl_pfn *pfn)
 {
 	return pfn->align;
+}
+
+NDCTL_EXPORT int ndctl_pfn_has_align(struct ndctl_pfn *pfn)
+{
+	struct ndctl_ctx *ctx = ndctl_pfn_get_ctx(pfn);
+	char *path = pfn->pfn_buf;
+	int len = pfn->buf_len;
+	struct stat st;
+
+	if (snprintf(path, len, "%s/align", pfn->pfn_path) >= len) {
+		err(ctx, "%s: buffer too small!\n",
+				ndctl_pfn_get_devname(pfn));
+		return 0;
+	}
+
+	return stat(path, &st) == 0;
 }
 
 NDCTL_EXPORT int ndctl_pfn_set_align(struct ndctl_pfn *pfn, unsigned long align)
@@ -4430,6 +4475,11 @@ NDCTL_EXPORT int ndctl_dax_set_location(struct ndctl_dax *dax,
 NDCTL_EXPORT unsigned long ndctl_dax_get_align(struct ndctl_dax *dax)
 {
 	return ndctl_pfn_get_align(&dax->pfn);
+}
+
+NDCTL_EXPORT int ndctl_dax_has_align(struct ndctl_dax *dax)
+{
+	return ndctl_pfn_has_align(&dax->pfn);
 }
 
 NDCTL_EXPORT int ndctl_dax_set_align(struct ndctl_dax *dax, unsigned long align)

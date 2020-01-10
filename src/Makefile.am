@@ -1,7 +1,7 @@
 include Makefile.am.in
 
 ACLOCAL_AMFLAGS = -I m4 ${ACLOCAL_FLAGS}
-SUBDIRS = . daxctl ndctl
+SUBDIRS = . daxctl/lib ndctl/lib ndctl daxctl
 if ENABLE_DOCS
 SUBDIRS += Documentation
 endif
@@ -64,6 +64,8 @@ libutil_a_SOURCES = \
 	util/parse-options.h \
 	util/usage.c \
 	util/size.c \
+	util/main.c \
+	util/help.c \
 	util/strbuf.c \
 	util/wrapper.c \
 	util/filter.c

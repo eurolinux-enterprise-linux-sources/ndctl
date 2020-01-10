@@ -1,0 +1,301 @@
+libndctl: add support for the MSFT family of DSM functions
+
+BZ: 
+
+commit 2cf2acca0288389a39ac823a42a5e048575d52db
+Author: Lijun Pan <Lijun.Pan@dell.com>
+Date:   Thu Apr 6 12:17:38 2017 -0500
+
+    libndctl: add support for the MSFT family of DSM functions
+    
+    This patch retrieves the health data from NVDIMM-N via
+    the MSFT _DSM function[1], following JESD245A[2] standards.
+    Now 'ndctl list --dimms --health --idle' could work
+    on MSFT type NVDIMM-N, but limited to health_state,
+    temperature_celsius, and life_used_percentage.
+    
+    Sample output of 'ndclt list --dimms --health --idle'
+    {
+      "dev":"nmem0",
+      "id":"802c-0f-1711-1648dd20",
+      "state":"disabled",
+      "health":{
+        "health_state":"ok",
+        "temperature_celsius":27.000000,
+        "life_used_percentage":3
+      }
+    }
+    
+    [1]. https://msdn.microsoft.com/library/windows/hardware/mt604741
+    [2]. https://www.jedec.org/sites/default/files/docs/JESD245A.pdf
+    
+    Cc: Stuart Hayes <Stuart.Hayes@dell.com>
+    Signed-off-by: Lijun Pan <Lijun.Pan@dell.com>
+    Tested-by: Linda Knippers <linda.knippers@hpe.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff -up ndctl-56/ndctl/lib/Makefile.am.orig ndctl-56/ndctl/lib/Makefile.am
+--- ndctl-56/ndctl/lib/Makefile.am.orig	2017-02-07 16:16:07.000000000 -0500
++++ ndctl-56/ndctl/lib/Makefile.am	2017-05-24 15:41:41.203723211 -0400
+@@ -32,6 +32,7 @@ endif
+ if ENABLE_SMART
+ libndctl_la_SOURCES += libndctl-smart.c
+ libndctl_la_SOURCES += libndctl-hpe1.c
++libndctl_la_SOURCES += libndctl-msft.c
+ endif
+ 
+ EXTRA_DIST += libndctl.sym
+diff -up ndctl-56/ndctl/lib/libndctl-msft.c.orig ndctl-56/ndctl/lib/libndctl-msft.c
+--- ndctl-56/ndctl/lib/libndctl-msft.c.orig	2017-05-24 15:41:41.205723213 -0400
++++ ndctl-56/ndctl/lib/libndctl-msft.c	2017-05-24 15:41:41.204723212 -0400
+@@ -0,0 +1,140 @@
++/*
++ * Copyright (C) 2016-2017 Dell, Inc.
++ * Copyright (C) 2016 Hewlett Packard Enterprise Development LP
++ * Copyright (c) 2016, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU Lesser General Public License,
++ * version 2.1, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
++ * more details.
++ */
++#include <stdlib.h>
++#include <limits.h>
++#include <util/log.h>
++#include <ndctl/libndctl.h>
++#include "libndctl-private.h"
++#include "ndctl-msft.h"
++
++#define CMD_MSFT(_c) ((_c)->msft)
++#define CMD_MSFT_SMART(_c) (CMD_MSFT(_c)->u.smart.data)
++
++static struct ndctl_cmd *msft_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
++{
++	struct ndctl_bus *bus = ndctl_dimm_get_bus(dimm);
++	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
++	struct ndctl_cmd *cmd;
++	size_t size;
++	struct ndn_pkg_msft *msft;
++
++	if (!ndctl_dimm_is_cmd_supported(dimm, ND_CMD_CALL)) {
++		dbg(ctx, "unsupported cmd\n");
++		return NULL;
++	}
++
++	size = sizeof(*cmd) + sizeof(struct ndn_pkg_msft);
++	cmd = calloc(1, size);
++	if (!cmd)
++		return NULL;
++
++	cmd->dimm = dimm;
++	ndctl_cmd_ref(cmd);
++	cmd->type = ND_CMD_CALL;
++	cmd->size = size;
++	cmd->status = 1;
++
++	msft = CMD_MSFT(cmd);
++	msft->gen.nd_family = NVDIMM_FAMILY_MSFT;
++	msft->gen.nd_command = NDN_MSFT_CMD_SMART;
++	msft->gen.nd_fw_size = 0;
++	msft->gen.nd_size_in = offsetof(struct ndn_msft_smart, status);
++	msft->gen.nd_size_out = sizeof(msft->u.smart);
++	msft->u.smart.status = 0;
++
++	cmd->firmware_status = &msft->u.smart.status;
++
++	return cmd;
++}
++
++static int msft_smart_valid(struct ndctl_cmd *cmd)
++{
++	if (cmd->type != ND_CMD_CALL ||
++	    cmd->size != sizeof(*cmd) + sizeof(struct ndn_pkg_msft) ||
++	    CMD_MSFT(cmd)->gen.nd_family != NVDIMM_FAMILY_MSFT ||
++	    CMD_MSFT(cmd)->gen.nd_command != NDN_MSFT_CMD_SMART ||
++	    cmd->status != 0)
++		return cmd->status < 0 ? cmd->status : -EINVAL;
++	return 0;
++}
++
++static unsigned int msft_cmd_smart_get_flags(struct ndctl_cmd *cmd)
++{
++	if (msft_smart_valid(cmd) < 0)
++		return UINT_MAX;
++
++	/* below health data can be retrieved via MSFT _DSM function 11 */
++	return NDN_MSFT_SMART_HEALTH_VALID |
++		NDN_MSFT_SMART_TEMP_VALID |
++		NDN_MSFT_SMART_USED_VALID;
++}
++
++static unsigned int num_set_bit_health(__u16 num)
++{
++	int i;
++	__u16 n = num & 0x7FFF;
++	unsigned int count = 0;
++
++	for (i = 0; i < 15; i++)
++		if (!!(n & (1 << i)))
++			count++;
++
++	return count;
++}
++
++static unsigned int msft_cmd_smart_get_health(struct ndctl_cmd *cmd)
++{
++	unsigned int health;
++	unsigned int num;
++
++	if (msft_smart_valid(cmd) < 0)
++		return UINT_MAX;
++
++	num = num_set_bit_health(CMD_MSFT_SMART(cmd)->health);
++	if (num == 0)
++		health = 0;
++	else if (num < 2)
++		health = ND_SMART_NON_CRITICAL_HEALTH;
++	else if (num < 3)
++		health = ND_SMART_CRITICAL_HEALTH;
++	else
++		health = ND_SMART_FATAL_HEALTH;
++
++	return health;
++}
++
++static unsigned int msft_cmd_smart_get_temperature(struct ndctl_cmd *cmd)
++{
++	if (msft_smart_valid(cmd) < 0)
++		return UINT_MAX;
++
++	return CMD_MSFT_SMART(cmd)->temp * 16;
++}
++
++static unsigned int msft_cmd_smart_get_life_used(struct ndctl_cmd *cmd)
++{
++	if (msft_smart_valid(cmd) < 0)
++		return UINT_MAX;
++
++	return 100 - CMD_MSFT_SMART(cmd)->nvm_lifetime;
++}
++
++struct ndctl_smart_ops * const msft_smart_ops = &(struct ndctl_smart_ops) {
++	.new_smart = msft_dimm_cmd_new_smart,
++	.smart_get_flags = msft_cmd_smart_get_flags,
++	.smart_get_health = msft_cmd_smart_get_health,
++	.smart_get_temperature = msft_cmd_smart_get_temperature,
++	.smart_get_life_used = msft_cmd_smart_get_life_used,
++};
+diff -up ndctl-56/ndctl/lib/libndctl-private.h.orig ndctl-56/ndctl/lib/libndctl-private.h
+--- ndctl-56/ndctl/lib/libndctl-private.h.orig	2017-02-07 16:16:07.000000000 -0500
++++ ndctl-56/ndctl/lib/libndctl-private.h	2017-05-24 15:41:41.206723214 -0400
+@@ -32,6 +32,7 @@
+ #include <ccan/endian/endian.h>
+ #include <ccan/short_types/short_types.h>
+ #include "ndctl-hpe1.h"
++#include "ndctl-msft.h"
+ 
+ #define SZ_16M 0x01000000
+ 
+@@ -196,6 +197,7 @@ struct ndctl_cmd {
+ 		struct nd_cmd_clear_error clear_err[0];
+ #endif
+ 		struct ndn_pkg_hpe1 hpe1[0];
++		struct ndn_pkg_msft msft[0];
+ 		struct nd_cmd_smart smart[0];
+ 		struct nd_cmd_smart_threshold smart_t[0];
+ 		struct nd_cmd_get_config_size get_size[0];
+@@ -226,9 +228,11 @@ struct ndctl_smart_ops {
+ #if HAS_SMART == 1
+ struct ndctl_smart_ops * const intel_smart_ops;
+ struct ndctl_smart_ops * const hpe1_smart_ops;
++struct ndctl_smart_ops * const msft_smart_ops;
+ #else
+ static struct ndctl_smart_ops * const intel_smart_ops = NULL;
+ static struct ndctl_smart_ops * const hpe1_smart_ops = NULL;
++static struct ndctl_smart_ops * const msft_smart_ops = NULL;
+ #endif
+ 
+ /* internal library helpers for conditionally defined command numbers */
+diff -up ndctl-56/ndctl/lib/libndctl.c.orig ndctl-56/ndctl/lib/libndctl.c
+--- ndctl-56/ndctl/lib/libndctl.c.orig	2017-02-07 16:16:07.000000000 -0500
++++ ndctl-56/ndctl/lib/libndctl.c	2017-05-24 15:41:41.208723216 -0400
+@@ -1254,6 +1254,8 @@ static void *add_dimm(void *parent, int
+ 		dimm->dsm_family = strtoul(buf, NULL, 0);
+ 	if (dimm->dsm_family == NVDIMM_FAMILY_HPE1)
+ 		dimm->smart_ops = hpe1_smart_ops;
++	if (dimm->dsm_family == NVDIMM_FAMILY_MSFT)
++		dimm->smart_ops = msft_smart_ops;
+ 
+ 	dimm->formats = formats;
+ 	sprintf(path, "%s/nfit/format", dimm_base);
+diff -up ndctl-56/ndctl/lib/ndctl-msft.h.orig ndctl-56/ndctl/lib/ndctl-msft.h
+--- ndctl-56/ndctl/lib/ndctl-msft.h.orig	2017-05-24 15:41:41.210723218 -0400
++++ ndctl-56/ndctl/lib/ndctl-msft.h	2017-05-24 15:41:41.209723217 -0400
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2016-2017 Dell, Inc.
++ * Copyright (C) 2016 Hewlett Packard Enterprise Development LP
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU Lesser General Public License,
++ * version 2.1, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
++ * more details.
++ */
++#ifndef __NDCTL_MSFT_H__
++#define __NDCTL_MSFT_H__
++
++enum {
++	NDN_MSFT_CMD_QUERY = 0,
++
++	/* non-root commands */
++	NDN_MSFT_CMD_SMART = 11,
++};
++
++/* NDN_MSFT_CMD_SMART */
++#define NDN_MSFT_SMART_HEALTH_VALID	ND_SMART_HEALTH_VALID
++#define NDN_MSFT_SMART_TEMP_VALID	ND_SMART_TEMP_VALID
++#define NDN_MSFT_SMART_USED_VALID	ND_SMART_USED_VALID
++
++/*
++ * This is actually function 11 data,
++ * This is the closest I can find to match smart
++ * Microsoft _DSM does not have smart function
++ */
++struct ndn_msft_smart_data {
++	__u16	health;
++	__u16	temp;
++	__u8	err_thresh_stat;
++	__u8	warn_thresh_stat;
++	__u8	nvm_lifetime;
++	__u8	count_dram_uncorr_err;
++	__u8	count_dram_corr_err;
++} __attribute__((packed));
++
++struct ndn_msft_smart {
++	__u32	status;
++	union {
++		__u8 buf[9];
++		struct ndn_msft_smart_data data[0];
++	};
++} __attribute__((packed));
++
++union ndn_msft_cmd {
++	__u32			query;
++	struct ndn_msft_smart	smart;
++} __attribute__((packed));
++
++struct ndn_pkg_msft {
++	struct nd_cmd_pkg	gen;
++	union ndn_msft_cmd	u;
++} __attribute__((packed));
++
++#endif /* __NDCTL_MSFT_H__ */

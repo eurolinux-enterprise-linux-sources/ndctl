@@ -31,6 +31,7 @@
 #include <ndctl/libndctl.h>
 #include <ccan/endian/endian.h>
 #include <ccan/short_types/short_types.h>
+#include "ndctl-hpe1.h"
 
 #define SZ_16M 0x01000000
 
@@ -134,6 +135,7 @@ struct ndctl_ctx {
 	/* log_ctx must be first member for ndctl_set_log_fn compat */
 	struct log_ctx ctx;
 	int refcount;
+	int regions_init;
 	void *userdata;
 	struct list_head busses;
 	int busses_init;
@@ -142,6 +144,7 @@ struct ndctl_ctx {
 	struct kmod_ctx *kmod_ctx;
 	struct daxctl_ctx *daxctl_ctx;
 	unsigned long timeout;
+	void *private_data;
 };
 
 /**
@@ -175,6 +178,7 @@ struct ndctl_cmd {
 	u32 *firmware_status;
 	struct ndctl_cmd_iter {
 		u32 *offset;
+		u32 *xfer; /* pointer to xfer length in cmd */
 		u8 *data; /* pointer to the data buffer location in cmd */
 		u32 max_xfer;
 		char *total_buf;
@@ -191,6 +195,7 @@ struct ndctl_cmd {
 #ifdef HAVE_NDCTL_CLEAR_ERROR
 		struct nd_cmd_clear_error clear_err[0];
 #endif
+		struct ndn_pkg_hpe1 hpe1[0];
 		struct nd_cmd_smart smart[0];
 		struct nd_cmd_smart_threshold smart_t[0];
 		struct nd_cmd_get_config_size get_size[0];
@@ -200,6 +205,31 @@ struct ndctl_cmd {
 		char cmd_buf[0];
 	};
 };
+
+struct ndctl_smart_ops {
+	struct ndctl_cmd *(*new_smart)(struct ndctl_dimm *);
+	unsigned int (*smart_get_flags)(struct ndctl_cmd *);
+	unsigned int (*smart_get_health)(struct ndctl_cmd *);
+	unsigned int (*smart_get_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_get_spares)(struct ndctl_cmd *);
+	unsigned int (*smart_get_alarm_flags)(struct ndctl_cmd *);
+	unsigned int (*smart_get_life_used)(struct ndctl_cmd *);
+	unsigned int (*smart_get_shutdown_state)(struct ndctl_cmd *);
+	unsigned int (*smart_get_vendor_size)(struct ndctl_cmd *);
+	unsigned char *(*smart_get_vendor_data)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_smart_threshold)(struct ndctl_dimm *);
+	unsigned int (*smart_threshold_get_alarm_control)(struct ndctl_cmd *);
+	unsigned int (*smart_threshold_get_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_threshold_get_spares)(struct ndctl_cmd *);
+};
+
+#if HAS_SMART == 1
+struct ndctl_smart_ops * const intel_smart_ops;
+struct ndctl_smart_ops * const hpe1_smart_ops;
+#else
+static struct ndctl_smart_ops * const intel_smart_ops = NULL;
+static struct ndctl_smart_ops * const hpe1_smart_ops = NULL;
+#endif
 
 /* internal library helpers for conditionally defined command numbers */
 #ifdef HAVE_NDCTL_ARS

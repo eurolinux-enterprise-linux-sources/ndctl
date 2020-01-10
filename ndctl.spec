@@ -1,11 +1,16 @@
 Name:		ndctl
-Version:	54
-Release:	1%{?dist}
+Version:	56
+Release:	2%{?dist}
 Summary:	Manage "libnvdimm" subsystem devices (Non-volatile Memory)
 License:	GPLv2
 Group:		System Environment/Base
 Url:		https://github.com/pmem/ndctl
 Source0:	https://github.com/pmem/%{name}/archive/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Patch0:		22bffbe-daxctl-add-libuuid-to-the-build.patch
+Patch1:		77d84b2-ndctl-create-namespace-include-dax-info-in-operation-result.patch
+Patch2:		rhel-ndctl-limit-device-dax-to-4k-by-default.patch
+Patch3:		rhel-ndctl-document-4k-alignment-default.patch
+Patch4:		2cf2acc-libndctl-add-support-for-the-MSFT-family-of-DSM-functions.patch
 
 Requires:	ndctl-libs%{?_isa} = %{version}-%{release}
 Requires:	daxctl-libs%{?_isa} = %{version}-%{release}
@@ -37,6 +42,18 @@ Requires:	ndctl-libs%{?_isa} = %{version}-%{release}
 %description -n ndctl-devel
 The %{name}-devel package contains libraries and header files for
 developing applications that use %{name}.
+
+%package -n daxctl
+Summary:        Manage Device-DAX instances
+License:        GPLv2
+Group:          System Environment/Base
+Requires:       daxctl-libs%{?_isa} = %{version}-%{release}
+
+%description -n daxctl
+The daxctl utility provides enumeration and provisioning commands for
+the Linux kernel Device-DAX facility. This facility enables DAX mappings
+of performance / feature differentiated memory without need of a
+filesystem.
 
 %package -n daxctl-devel
 Summary:	Development files for libdaxctl
@@ -74,6 +91,11 @@ control API for these devices.
 
 %prep
 %setup -q ndctl-%{version}
+%patch0 -p1
+%patch1 -p1
+%patch2 -p1
+%patch3 -p1
+%patch4 -p1
 
 %build
 echo %{version} > version
@@ -99,35 +121,54 @@ make check
 %define bashcompdir %(pkg-config --variable=completionsdir bash-completion)
 
 %files
-%license licenses/GPLv2 licenses/BSD-MIT licenses/CC0
+%license util/COPYING licenses/BSD-MIT licenses/CC0
 %{_bindir}/ndctl
-%{_mandir}/man1/*
+%{_mandir}/man1/ndctl*
 %{bashcompdir}/
+
+%files -n daxctl
+%license util/COPYING licenses/BSD-MIT licenses/CC0
+%{_bindir}/daxctl
+%{_mandir}/man1/daxctl*
 
 %files -n ndctl-libs
 %doc README.md
-%license COPYING licenses/BSD-MIT licenses/CC0
+%license util/COPYING licenses/BSD-MIT licenses/CC0
 %{_libdir}/libndctl.so.*
 
 %files -n daxctl-libs
 %doc README.md
-%license COPYING licenses/BSD-MIT licenses/CC0
+%license util/COPYING licenses/BSD-MIT licenses/CC0
 %{_libdir}/libdaxctl.so.*
 
 %files -n ndctl-devel
-%license COPYING
+%license util/COPYING
 %{_includedir}/ndctl/
 %{_libdir}/libndctl.so
 %{_libdir}/pkgconfig/libndctl.pc
 
 %files -n daxctl-devel
-%license COPYING
+%license util/COPYING
 %{_includedir}/daxctl/
 %{_libdir}/libdaxctl.so
 %{_libdir}/pkgconfig/libdaxctl.pc
 
 
 %changelog
+* Tue May 30 2017 Jeff Moyer <jmoyer@redhat.com> - 56-2
+- bump release
+- Related: bz#1440902 bz#1446689
+
+* Wed May 24 2017 Jeff Moyer <jmoyer@redhat.com> - 56-2
+- Update documentation to reflect 4k alignment
+- Add support for the MSFT family of DSM functions
+- Resolves: bz#1440902 bz#1446689
+
+* Sun Mar 26 2017 Jeff Moyer <jmoyer@redhat.com> - 56-1
+- Rebase to upstream version 56
+- Default to 4k alignment for device dax
+- Resolves: bz#1384873 bz#1384642 bz#1349233 bz#1357451
+
 * Mon Aug 29 2016 Dave Anderson <anderson@redhat.com> - 54.1
 - Update to 54.1 to address ixpdimm_sw requirements
 - Resolves bz#1271425

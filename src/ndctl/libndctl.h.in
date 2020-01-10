@@ -77,6 +77,8 @@ struct ndctl_ctx;
 struct ndctl_ctx *ndctl_ref(struct ndctl_ctx *ctx);
 struct ndctl_ctx *ndctl_unref(struct ndctl_ctx *ctx);
 int ndctl_new(struct ndctl_ctx **ctx);
+void ndctl_set_private_data(struct ndctl_ctx *ctx, void *data);
+void *ndctl_get_private_data(struct ndctl_ctx *ctx);
 struct daxctl_ctx;
 struct daxctl_ctx *ndctl_get_daxctl_ctx(struct ndctl_ctx *ctx);
 void ndctl_invalidate(struct ndctl_ctx *ctx);
@@ -143,6 +145,7 @@ int ndctl_dimm_failed_arm(struct ndctl_dimm *dimm);
 int ndctl_dimm_failed_restore(struct ndctl_dimm *dimm);
 int ndctl_dimm_smart_pending(struct ndctl_dimm *dimm);
 int ndctl_dimm_failed_flush(struct ndctl_dimm *dimm);
+int ndctl_dimm_get_health_eventfd(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_node(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_socket(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_imc(struct ndctl_dimm *dimm);
@@ -150,6 +153,7 @@ unsigned int ndctl_dimm_handle_get_channel(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_dimm(struct ndctl_dimm *dimm);
 const char *ndctl_dimm_get_devname(struct ndctl_dimm *dimm);
 struct ndctl_bus *ndctl_dimm_get_bus(struct ndctl_dimm *dimm);
+struct ndctl_smart_ops *ndctl_dimm_get_smart_ops(struct ndctl_dimm *dimm);
 struct ndctl_ctx *ndctl_dimm_get_ctx(struct ndctl_dimm *dimm);
 struct ndctl_dimm *ndctl_dimm_get_by_handle(struct ndctl_bus *bus,
 		unsigned int handle);
@@ -354,6 +358,7 @@ unsigned long ndctl_dimm_get_available_labels(struct ndctl_dimm *dimm);
 unsigned int ndctl_cmd_cfg_size_get_size(struct ndctl_cmd *cfg_size);
 ssize_t ndctl_cmd_cfg_read_get_data(struct ndctl_cmd *cfg_read, void *buf,
 		unsigned int len, unsigned int offset);
+ssize_t ndctl_cmd_cfg_read_get_size(struct ndctl_cmd *cfg_read);
 ssize_t ndctl_cmd_cfg_write_set_data(struct ndctl_cmd *cfg_write, void *buf,
 		unsigned int len, unsigned int offset);
 ssize_t ndctl_cmd_cfg_write_zero_data(struct ndctl_cmd *cfg_write);
@@ -470,6 +475,7 @@ enum ndctl_namespace_mode {
 	NDCTL_NS_MODE_SAFE,
 	NDCTL_NS_MODE_RAW,
 	NDCTL_NS_MODE_DAX,
+	NDCTL_NS_MODE_UNKNOWN,
 };
 enum ndctl_namespace_mode ndctl_namespace_get_mode(
 		struct ndctl_namespace *ndns);
@@ -563,6 +569,7 @@ int ndctl_pfn_set_location(struct ndctl_pfn *pfn, enum ndctl_pfn_loc loc);
 enum ndctl_pfn_loc ndctl_pfn_get_location(struct ndctl_pfn *pfn);
 int ndctl_pfn_set_uuid(struct ndctl_pfn *pfn, uuid_t uu);
 void ndctl_pfn_get_uuid(struct ndctl_pfn *pfn, uuid_t uu);
+int ndctl_pfn_has_align(struct ndctl_pfn *pfn);
 int ndctl_pfn_set_align(struct ndctl_pfn *pfn, unsigned long align);
 unsigned long ndctl_pfn_get_align(struct ndctl_pfn *pfn);
 unsigned long long ndctl_pfn_get_resource(struct ndctl_pfn *pfn);
@@ -596,6 +603,7 @@ int ndctl_dax_set_uuid(struct ndctl_dax *dax, uuid_t uu);
 enum ndctl_pfn_loc ndctl_dax_get_location(struct ndctl_dax *dax);
 int ndctl_dax_set_location(struct ndctl_dax *dax, enum ndctl_pfn_loc loc);
 unsigned long ndctl_dax_get_align(struct ndctl_dax *dax);
+int ndctl_dax_has_align(struct ndctl_dax *dax);
 int ndctl_dax_set_align(struct ndctl_dax *dax, unsigned long align);
 int ndctl_dax_set_namespace(struct ndctl_dax *dax,
 		struct ndctl_namespace *ndns);

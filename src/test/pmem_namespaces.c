@@ -178,24 +178,20 @@ static int ns_do_io(const char *bdev)
 
 static const char *comm = "test-pmem-namespaces";
 
-int test_pmem_namespaces(int log_level, struct ndctl_test *test)
+int test_pmem_namespaces(int log_level, struct ndctl_test *test,
+		struct ndctl_ctx *ctx)
 {
 	struct ndctl_region *region, *pmem_region = NULL;
 	struct kmod_ctx *kmod_ctx = NULL;
 	struct kmod_module *mod = NULL;
 	struct ndctl_namespace *ndns;
 	struct ndctl_dimm *dimm;
-	struct ndctl_ctx *ctx;
 	struct ndctl_bus *bus;
+	int rc = -ENXIO;
 	char bdev[50];
-	int rc;
 
 	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 2, 0)))
 		return 77;
-
-	rc = ndctl_new(&ctx);
-	if (rc < 0)
-		return rc;
 
 	ndctl_set_log_priority(ctx, log_level);
 
@@ -212,18 +208,7 @@ int test_pmem_namespaces(int log_level, struct ndctl_test *test)
 
 	if (!bus) {
 		fprintf(stderr, "ACPI.NFIT unavailable falling back to nfit_test\n");
-		kmod_ctx = kmod_new(NULL, NULL);
-		if (!kmod_ctx)
-			goto err_kmod;
-		kmod_set_log_priority(kmod_ctx, log_level);
-
-		rc = kmod_module_new_from_name(kmod_ctx, "nfit_test", &mod);
-		if (rc < 0)
-			goto err_module;
-
-		rc = kmod_module_probe_insert_module(mod,
-				KMOD_PROBE_APPLY_BLACKLIST,
-				NULL, NULL, NULL, NULL);
+		rc = nfit_test_init(&kmod_ctx, &mod, log_level);
 		ndctl_invalidate(ctx);
 		bus = ndctl_bus_get_by_provider(ctx, "nfit_test.0");
 		if (rc < 0 || !bus) {
@@ -289,14 +274,13 @@ int test_pmem_namespaces(int log_level, struct ndctl_test *test)
 
  err_module:
 	kmod_unref(kmod_ctx);
- err_kmod:
-	ndctl_unref(ctx);
 	return rc;
 }
 
 int __attribute__((weak)) main(int argc, char *argv[])
 {
 	struct ndctl_test *test = ndctl_test_new(0);
+	struct ndctl_ctx *ctx;
 	int rc;
 
 	comm = argv[0];
@@ -305,6 +289,11 @@ int __attribute__((weak)) main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	rc = test_pmem_namespaces(LOG_DEBUG, test);
+	rc = ndctl_new(&ctx);
+	if (rc)
+		return ndctl_test_result(test, rc);
+
+	rc = test_pmem_namespaces(LOG_DEBUG, test, ctx);
+	ndctl_unref(ctx);
 	return ndctl_test_result(test, rc);
 }

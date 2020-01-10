@@ -1,0 +1,32 @@
+LIBNDCTL_1 {
+global:
+	daxctl_get_userdata;
+	daxctl_set_userdata;
+	daxctl_ref;
+	daxctl_get_log_priority;
+	daxctl_set_log_fn;
+	daxctl_unref;
+	daxctl_set_log_priority;
+	daxctl_new;
+local:
+        *;
+};
+
+LIBNDCTL_2 {
+global:
+	daxctl_region_unref;
+	daxctl_new_region;
+	daxctl_region_ref;
+	daxctl_region_unref;
+	daxctl_region_get_uuid;
+	daxctl_region_get_id;
+	daxctl_region_get_ctx;
+	daxctl_dev_get_first;
+	daxctl_dev_get_next;
+	daxctl_dev_get_region;
+	daxctl_dev_get_id;
+	daxctl_dev_get_devname;
+	daxctl_dev_get_major;
+	daxctl_dev_get_minor;
+	daxctl_dev_get_size;
+} LIBNDCTL_1;

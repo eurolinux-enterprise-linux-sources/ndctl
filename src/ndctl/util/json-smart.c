@@ -1,3 +1,15 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
 #include <limits.h>
 #include <util/json.h>
 #include <uuid/uuid.h>
@@ -83,8 +95,14 @@ struct json_object *util_dimm_health_to_json(struct ndctl_dimm *dimm)
 		goto err;
 
 	rc = ndctl_cmd_submit(cmd);
-	if (rc || ndctl_cmd_get_firmware_status(cmd))
-		goto err;
+	if (rc || ndctl_cmd_get_firmware_status(cmd)) {
+		if (!ndctl_dimm_is_cmd_supported(dimm, ND_CMD_SMART))
+			goto err;
+		jobj = json_object_new_string("unknown");
+		if (jobj)
+			json_object_object_add(jhealth, "health_state", jobj);
+		goto out;
+	}
 
 	flags = ndctl_cmd_smart_get_flags(cmd);
 	if (flags & ND_SMART_HEALTH_VALID) {
@@ -155,7 +173,9 @@ struct json_object *util_dimm_health_to_json(struct ndctl_dimm *dimm)
 	return jhealth;
  err:
 	json_object_put(jhealth);
+	jhealth = NULL;
+ out:
 	if (cmd)
 		ndctl_cmd_unref(cmd);
-	return NULL;
+	return jhealth;
 }

@@ -1,3 +1,15 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
 #ifndef __TEST_H__
 #define __TEST_H__
 struct ndctl_test;
@@ -17,7 +29,7 @@ void builtin_xaction_namespace_reset(void);
 struct kmod_ctx;
 struct kmod_module;
 int nfit_test_init(struct kmod_ctx **ctx, struct kmod_module **mod,
-	int log_level);
+	int log_level, struct ndctl_test *test);
 
 struct ndctl_ctx;
 int test_parent_uuid(int loglevel, struct ndctl_test *test, struct ndctl_ctx *ctx);

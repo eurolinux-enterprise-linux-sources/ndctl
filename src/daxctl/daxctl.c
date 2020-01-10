@@ -1,3 +1,19 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2005 Andreas Ericsson. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
+
+/* originally copied from perf and git */
+
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
@@ -51,11 +67,17 @@ static int cmd_help(int argc, const char **argv, void *ctx)
 }
 
 int cmd_list(int argc, const char **argv, void *ctx);
+#ifdef ENABLE_DAXIO
+int cmd_io(int argc, const char **argv, void *ctx);
+#endif
 
 static struct cmd_struct commands[] = {
 	{ "version", cmd_version },
 	{ "list", cmd_list },
 	{ "help", cmd_help },
+#ifdef ENABLE_DAXIO
+	{ "io", cmd_io },
+#endif
 };
 
 int main(int argc, const char **argv)

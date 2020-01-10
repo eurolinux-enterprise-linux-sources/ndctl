@@ -1,3 +1,19 @@
+/*
+ * Copyright(c) 2005 Junio C Hamano. All rights reserved.
+ * Copyright(c) 2005 Linus Torvalds. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
+
+/* originally copied from perf and git */
+
 #ifndef __UTIL_H__
 #define __UTIL_H__
 #include <stdarg.h>
@@ -23,6 +39,17 @@
 
 #define alloc_nr(x) (((x)+16)*3/2)
 
+#define __round_mask(x, y) ((__typeof__(x))((y)-1))
+#define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
+#define round_down(x, y) ((x) & ~__round_mask(x, y))
+
+#define rounddown(x, y) (				\
+{							\
+	typeof(x) __x = (x);				\
+	__x - (__x % (y));				\
+}							\
+)
+
 /*
  * Realloc the buffer pointed at by variable 'x' so that it can hold
  * at least 'nr' entries; the number of entries currently allocated
@@ -44,6 +71,7 @@
 #define zfree(ptr) ({ free(*ptr); *ptr = NULL; })
 
 #define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e); }))
+#define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
 static inline const char *skip_prefix(const char *str, const char *prefix)
 {

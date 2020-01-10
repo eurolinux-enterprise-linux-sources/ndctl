@@ -1,0 +1,29 @@
+commit 775293e93fbc9efafa4672ba8698e427613927f6
+Author: Jeff Moyer <jmoyer@redhat.com>
+Date:   Mon Oct 16 15:07:38 2017 -0400
+
+    btt_check_arenas: fix use of uninitialized variable
+    
+    Coverity complains that rc, passed to btt_xlat_status, may be
+    used uninitialized.  Further, we could then dereference a NULL
+    pointer.  Fix this.
+    
+    Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+
+diff --git a/ndctl/check.c b/ndctl/check.c
+index 915bb9d..93f95c6 100644
+--- a/ndctl/check.c
++++ b/ndctl/check.c
+@@ -582,9 +582,10 @@ static int btt_check_arenas(struct btt_chk *bttc)
+ 			break;
+ 	}
+ 
+-	btt_xlat_status(a, rc);
+-	if (rc)
++	if (a && rc != BTT_OK) {
++		btt_xlat_status(a, rc);
+ 		return -ENXIO;
++	}
+ 	return 0;
+ }
+ 

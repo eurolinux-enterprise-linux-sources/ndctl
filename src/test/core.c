@@ -1,3 +1,15 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
 #include <linux/version.h>
 #include <sys/utsname.h>
 #include <libkmod.h>
@@ -104,14 +116,15 @@ int ndctl_test_get_skipped(struct ndctl_test *test)
 }
 
 int nfit_test_init(struct kmod_ctx **ctx, struct kmod_module **mod,
-		int log_level)
+		int log_level, struct ndctl_test *test)
 {
 	int rc;
 	unsigned int i;
+	const char *name;
 	struct log_ctx log_ctx;
 	const char *list[] = {
 		"nfit",
-		"dax",
+		"device_dax",
 		"dax_pmem",
 		"libnvdimm",
 		"nd_blk",
@@ -136,11 +149,21 @@ int nfit_test_init(struct kmod_ctx **ctx, struct kmod_module **mod,
 	 */
 	for (i = 0; i < ARRAY_SIZE(list); i++) {
 		char attr[SYSFS_ATTR_SIZE];
-		const char *name = list[i];
 		const char *path;
 		char buf[100];
 		int state;
 
+		name = list[i];
+
+		/*
+		 * Don't check for device-dax modules on kernels older
+		 * than 4.7.
+		 */
+		if (strstr(name, "dax")
+				&& !ndctl_test_attempt(test,
+					KERNEL_VERSION(4, 7, 0)))
+			continue;
+retry:
 		rc = kmod_module_new_from_name(*ctx, name, mod);
 		if (rc) {
 			log_err(&log_ctx, "%s.ko: missing\n", name);
@@ -181,6 +204,11 @@ int nfit_test_init(struct kmod_ctx **ctx, struct kmod_module **mod,
 	}
 
 	if (i < ARRAY_SIZE(list)) {
+		/* device-dax changed module names in 4.12 */
+		if (strcmp(name, "device_dax") == 0) {
+			name = "dax";
+			goto retry;
+		}
 		kmod_unref(*ctx);
 		return -ENXIO;
 	}

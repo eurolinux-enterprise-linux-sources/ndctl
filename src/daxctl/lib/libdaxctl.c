@@ -27,6 +27,8 @@
 #include <daxctl/libdaxctl.h>
 #include "libdaxctl-private.h"
 
+static const char *attrs = "dax_region";
+
 /**
  * struct daxctl_ctx - library user context to find "nd" instances
  *
@@ -219,16 +221,18 @@ DAXCTL_EXPORT void daxctl_region_ref(struct daxctl_region *region)
 		region->refcount++;
 }
 
-static void *add_dax_region(void *parent, int id, const char *base)
+static struct daxctl_region *add_dax_region(void *parent, int id,
+		const char *base)
 {
 	struct daxctl_region *region, *region_dup;
-	const char *attrs = "dax_region";
 	struct daxctl_ctx *ctx = parent;
 	char buf[SYSFS_ATTR_SIZE];
 	char *path;
 
+	dbg(ctx, "%s: \'%s\'\n", __func__, base);
+
 	daxctl_region_foreach(ctx, region_dup)
-		if (region_dup->id == id)
+		if (strcmp(region_dup->region_path, base) == 0)
 			return region_dup;
 
 	path = calloc(1, strlen(base) + 100);
@@ -255,12 +259,12 @@ static void *add_dax_region(void *parent, int id, const char *base)
 	if (sysfs_read_attr(ctx, path, buf) == 0)
 		region->align = strtoul(buf, NULL, 0);
 
-	sprintf(path, "%s/%s", base, attrs);
-	region->region_path = strdup(path);
+	region->region_path = strdup(base);
 	if (!region->region_path)
 		goto err_read;
 
-	region->region_buf = calloc(1, strlen(path) + REGION_BUF_SIZE);
+	region->region_buf = calloc(1, strlen(path) + strlen(attrs)
+			+ REGION_BUF_SIZE);
 	if (!region->region_buf)
 		goto err_read;
 	region->buf_len = strlen(path) + REGION_BUF_SIZE;
@@ -306,6 +310,7 @@ static void *add_dax_dev(void *parent, int id, const char *daxdev_base)
 
 	if (!path)
 		return NULL;
+	dbg(ctx, "%s: base: \'%s\'\n", __func__, daxdev_base);
 
 	dev = calloc(1, sizeof(*dev));
 	if (!dev)
@@ -373,6 +378,11 @@ DAXCTL_EXPORT const char *daxctl_region_get_devname(struct daxctl_region *region
 	return region->devname;
 }
 
+DAXCTL_EXPORT const char *daxctl_region_get_path(struct daxctl_region *region)
+{
+	return region->region_path;
+}
+
 DAXCTL_EXPORT unsigned long long daxctl_region_get_available_size(
 		struct daxctl_region *region)
 {
@@ -382,8 +392,8 @@ DAXCTL_EXPORT unsigned long long daxctl_region_get_available_size(
 	int len = region->buf_len;
 	unsigned long long avail;
 
-	if (snprintf(path, len, "%s/available_size",
-				region->region_path) >= len) {
+	if (snprintf(path, len, "%s/%s/available_size",
+				region->region_path, attrs) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				daxctl_region_get_devname(region));
 		return 0;
@@ -407,7 +417,7 @@ DAXCTL_EXPORT struct daxctl_dev *daxctl_region_get_dev_seed(
 	char buf[SYSFS_ATTR_SIZE];
 	struct daxctl_dev *dev;
 
-	if (snprintf(path, len, "%s/seed", region->region_path) >= len) {
+	if (snprintf(path, len, "%s/%s/seed", region->region_path, attrs) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				daxctl_region_get_devname(region));
 		return NULL;
@@ -433,20 +443,48 @@ static void dax_devices_init(struct daxctl_region *region)
 
 	region->devices_init = 1;
 	sprintf(daxdev_fmt, "dax%d.", region->id);
-	region_path = strdup(region->region_path);
-	if (region_path) {
-		char *c = strrchr(region_path, '_');
-
-		/* convert <devpath>/dax_region to <devpath>/dax */
-		*c = '\0';
-		sysfs_device_parse(ctx, region_path, daxdev_fmt, region,
-				add_dax_dev);
+	if (asprintf(&region_path, "%s/dax", region->region_path) < 0) {
+		dbg(ctx, "region path alloc fail\n");
+		return;
 	}
+	sysfs_device_parse(ctx, region_path, daxdev_fmt, region, add_dax_dev);
 	free(region_path);
+}
+
+static char *dax_region_path(const char *base, const char *device)
+{
+	char *path, *region_path, *c;
+
+	if (asprintf(&path, "%s/%s", base, device) < 0)
+		return NULL;
+
+	/* dax_region must be the instance's direct parent */
+	region_path = canonicalize_file_name(path);
+	free(path);
+	if (!region_path)
+		return NULL;
+
+	/* 'region_path' is now regionX/dax/daxX.Y', trim back to regionX */
+	c = strrchr(region_path, '/');
+	if (!c) {
+		free(region_path);
+		return NULL;
+	}
+	*c = '\0';
+
+	c = strrchr(region_path, '/');
+	if (!c) {
+		free(region_path);
+		return NULL;
+	}
+	*c = '\0';
+
+	return region_path;
 }
 
 static void dax_regions_init(struct daxctl_ctx *ctx)
 {
+	const char *base = "/sys/class/dax";
 	struct dirent *de;
 	DIR *dir;
 
@@ -455,7 +493,7 @@ static void dax_regions_init(struct daxctl_ctx *ctx)
 
 	ctx->regions_init = 1;
 
-	dir = opendir("/sys/class/dax");
+	dir = opendir(base);
 	if (!dir) {
 		dbg(ctx, "no dax regions found\n");
 		return;
@@ -470,11 +508,11 @@ static void dax_regions_init(struct daxctl_ctx *ctx)
 			continue;
 		if (sscanf(de->d_name, "dax%d.%d", &region_id, &id) != 2)
 			continue;
-		if (asprintf(&dev_path, "/sys/class/dax/%s/device", de->d_name) < 0) {
+		dev_path = dax_region_path(base, de->d_name);
+		if (!dev_path) {
 			err(ctx, "dax region path allocation failure\n");
 			continue;
 		}
-
 		region = add_dax_region(ctx, region_id, dev_path);
 		free(dev_path);
 		if (!region)

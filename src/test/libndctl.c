@@ -247,21 +247,23 @@ struct namespace {
 	uuid_t uuid;
 	int do_configure;
 	int check_alt_name;
-	int num_sector_sizes;
 	int ro;
+	int num_sector_sizes;
 	unsigned long *sector_sizes;
 };
 
 static uuid_t null_uuid;
-static unsigned long blk_sector_sizes[7] = { 512, 520, 528, 4096, 4104, 4160, 4224, };
-static unsigned long pmem_sector_sizes[1] = { 0 };
+static unsigned long blk_sector_sizes[] = { 512, 520, 528, 4096, 4104, 4160, 4224, };
+static unsigned long pmem_sector_sizes[] = { 512, 4096 };
+static unsigned long io_sector_sizes[] = { 0 };
 
 static struct namespace namespace0_pmem0 = {
 	0, "namespace_pmem", &btt_settings, &pfn_settings, &dax_settings, SZ_18M,
 	{ 1, 1, 1, 1,
 	  1, 1, 1, 1,
 	  1, 1, 1, 1,
-	  1, 1, 1, 1, }, 1, 1, 1, 0, pmem_sector_sizes,
+	  1, 1, 1, 1, }, 1, 1, 0,
+	ARRAY_SIZE(pmem_sector_sizes), pmem_sector_sizes,
 };
 
 static struct namespace namespace1_pmem0 = {
@@ -269,7 +271,8 @@ static struct namespace namespace1_pmem0 = {
 	{ 2, 2, 2, 2,
 	  2, 2, 2, 2,
 	  2, 2, 2, 2,
-	  2, 2, 2, 2, }, 1, 1, 1, 0, pmem_sector_sizes,
+	  2, 2, 2, 2, }, 1, 1, 0,
+	ARRAY_SIZE(pmem_sector_sizes), pmem_sector_sizes,
 };
 
 static struct namespace namespace2_blk0 = {
@@ -277,7 +280,8 @@ static struct namespace namespace2_blk0 = {
 	{ 3, 3, 3, 3,
 	  3, 3, 3, 3,
 	  3, 3, 3, 3,
-	  3, 3, 3, 3, }, 1, 1, 7, 0, blk_sector_sizes,
+	  3, 3, 3, 3, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct namespace namespace2_blk1 = {
@@ -285,7 +289,8 @@ static struct namespace namespace2_blk1 = {
 	{ 4, 4, 4, 4,
 	  4, 4, 4, 4,
 	  4, 4, 4, 4,
-	  4, 4, 4, 4, }, 1, 1, 7, 0, blk_sector_sizes,
+	  4, 4, 4, 4, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct namespace namespace3_blk0 = {
@@ -293,7 +298,8 @@ static struct namespace namespace3_blk0 = {
 	{ 5, 5, 5, 5,
 	  5, 5, 5, 5,
 	  5, 5, 5, 5,
-	  5, 5, 5, 5, }, 1, 1, 7, 0, blk_sector_sizes,
+	  5, 5, 5, 5, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct namespace namespace3_blk1 = {
@@ -301,7 +307,8 @@ static struct namespace namespace3_blk1 = {
 	{ 6, 6, 6, 6,
 	  6, 6, 6, 6,
 	  6, 6, 6, 6,
-	  6, 6, 6, 6, }, 1, 1, 7, 0, blk_sector_sizes,
+	  6, 6, 6, 6, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct namespace namespace4_blk0 = {
@@ -309,7 +316,8 @@ static struct namespace namespace4_blk0 = {
 	{ 7, 7, 7, 7,
 	  7, 7, 7, 7,
 	  7, 7, 7, 7,
-	  7, 7, 7, 7, }, 1, 1, 7, 0, blk_sector_sizes,
+	  7, 7, 7, 7, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct namespace namespace5_blk0 = {
@@ -317,7 +325,8 @@ static struct namespace namespace5_blk0 = {
 	{ 8, 8, 8, 8,
 	  8, 8, 8, 8,
 	  8, 8, 8, 8,
-	  8, 8, 8, 8, }, 1, 1, 7, 0, blk_sector_sizes,
+	  8, 8, 8, 8, }, 1, 1, 0,
+	ARRAY_SIZE(blk_sector_sizes), blk_sector_sizes,
 };
 
 static struct region regions0[] = {
@@ -384,7 +393,7 @@ static struct namespace namespace1 = {
 	{ 0, 0, 0, 0,
 	  0, 0, 0, 0,
 	  0, 0, 0, 0,
-	  0, 0, 0, 0, }, -1, 0, 1, 1, pmem_sector_sizes,
+	  0, 0, 0, 0, }, -1, 0, 1, ARRAY_SIZE(io_sector_sizes), io_sector_sizes,
 };
 
 static struct region regions1[] = {
@@ -736,6 +745,8 @@ static int __check_dax_create(struct ndctl_region *region,
 		enum ndctl_pfn_loc loc, uuid_t uuid)
 {
 	struct ndctl_dax *dax_seed = ndctl_region_get_dax_seed(region);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	enum ndctl_namespace_mode mode;
 	struct ndctl_dax *dax;
 	const char *devname;
@@ -753,6 +764,12 @@ static int __check_dax_create(struct ndctl_region *region,
 	 * alignment is PAGE_SIZE
 	 */
 	ndctl_dax_set_align(dax, SZ_4K);
+
+	rc = ndctl_namespace_set_enforce_mode(ndns, NDCTL_NS_MODE_DAX);
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0)) && rc < 0) {
+		fprintf(stderr, "%s: failed to enforce dax mode\n", devname);
+		return rc;
+	}
 	ndctl_dax_set_namespace(dax, ndns);
 	rc = ndctl_dax_enable(dax);
 	if (rc) {
@@ -838,6 +855,8 @@ static int __check_pfn_create(struct ndctl_region *region,
 		void *buf, enum ndctl_pfn_loc loc, uuid_t uuid)
 {
 	struct ndctl_pfn *pfn_seed = ndctl_region_get_pfn_seed(region);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	enum ndctl_namespace_mode mode;
 	struct ndctl_pfn *pfn;
 	const char *devname;
@@ -857,6 +876,11 @@ static int __check_pfn_create(struct ndctl_region *region,
 	 * alignment is PAGE_SIZE
 	 */
 	ndctl_pfn_set_align(pfn, SZ_4K);
+	rc = ndctl_namespace_set_enforce_mode(ndns, NDCTL_NS_MODE_MEMORY);
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0)) && rc < 0) {
+		fprintf(stderr, "%s: failed to enforce pfn mode\n", devname);
+		return rc;
+	}
 	ndctl_pfn_set_namespace(pfn, ndns);
 	rc = ndctl_pfn_enable(pfn);
 	if (rc) {
@@ -970,6 +994,8 @@ static int check_pfn_create(struct ndctl_region *region,
 
 static int check_btt_size(struct ndctl_btt *btt)
 {
+	struct ndctl_ctx *ctx = ndctl_btt_get_ctx(btt);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct ndctl_namespace *ndns = ndctl_btt_get_namespace(btt);
 	unsigned long long ns_size = ndctl_namespace_get_size(ndns);
 	unsigned long sect_size = ndctl_btt_get_sector_size(btt);
@@ -977,16 +1003,16 @@ static int check_btt_size(struct ndctl_btt *btt)
 	int size_select, sect_select;
 	unsigned long long expect_table[][2] = {
 		[0] = {
-			[0] = 0x11b4400,
-			[1] = 0x8da2000,
+			[0] = 0x11b5400,
+			[1] = 0x8daa000,
 		},
 		[1] = {
-			[0] = 0x13b0400,
-			[1] = 0x9d82000,
+			[0] = 0x13b1400,
+			[1] = 0x9d8a000,
 		},
 		[2] = {
-			[0] = 0x1aa2600,
-			[1] = 0xd513000,
+			[0] = 0x1aa3600,
+			[1] = 0xd51b000,
 		},
 	};
 
@@ -1018,6 +1044,10 @@ static int check_btt_size(struct ndctl_btt *btt)
 		return -ENXIO;
 	}
 
+	/* prior to 4.8 btt devices did not have a size attribute */
+	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 8, 0)))
+		return 0;
+
 	expect = expect_table[size_select][sect_select];
 	actual = ndctl_btt_get_size(btt);
 	if (expect != actual) {
@@ -1033,6 +1063,8 @@ static int check_btt_size(struct ndctl_btt *btt)
 static int check_btt_create(struct ndctl_region *region, struct ndctl_namespace *ndns,
 		struct namespace *namespace)
 {
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct btt *btt_s = namespace->btt_settings;
 	int i, fd, retry = 10;
 	struct ndctl_btt *btt;
@@ -1059,6 +1091,12 @@ static int check_btt_create(struct ndctl_region *region, struct ndctl_namespace 
 		devname = ndctl_btt_get_devname(btt);
 		ndctl_btt_set_uuid(btt, btt_s->uuid);
 		ndctl_btt_set_sector_size(btt, btt_s->sector_sizes[i]);
+		rc = ndctl_namespace_set_enforce_mode(ndns, NDCTL_NS_MODE_SAFE);
+		if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0)) && rc < 0) {
+			fprintf(stderr, "%s: failed to enforce btt mode\n", devname);
+			goto err;
+		}
+
 		ndctl_btt_set_namespace(btt, ndns);
 		rc = ndctl_btt_enable(btt);
 		if (namespace->ro == (rc == 0)) {
@@ -1070,14 +1108,20 @@ static int check_btt_create(struct ndctl_region *region, struct ndctl_namespace 
 			goto err;
 		}
 
-		mode = ndctl_namespace_get_mode(ndns);
-		if (mode >= 0 && mode != NDCTL_NS_MODE_SAFE)
-			fprintf(stderr, "%s: expected safe mode got: %d\n",
-					devname, mode);
+		/* prior to v4.5 the mode attribute did not exist */
+		if (ndctl_test_attempt(test, KERNEL_VERSION(4, 5, 0))) {
+			mode = ndctl_namespace_get_mode(ndns);
+			if (mode >= 0 && mode != NDCTL_NS_MODE_SAFE)
+				fprintf(stderr, "%s: expected safe mode got: %d\n",
+						devname, mode);
+		}
 
-		rc = check_btt_size(btt);
-		if (rc)
-			goto err;
+		/* prior to v4.13 the expected sizes were different due to BTT1.1 */
+		if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0))) {
+			rc = check_btt_size(btt);
+			if (rc)
+				goto err;
+		}
 
 		if (btt_seed == ndctl_region_get_btt_seed(region)
 				&& btt == btt_seed) {
@@ -1226,9 +1270,12 @@ static int check_pfn_autodetect(struct ndctl_bus *bus,
 		struct namespace *namespace)
 {
 	struct ndctl_region *region = ndctl_namespace_get_region(ndns);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
 	const char *devname = ndctl_namespace_get_devname(ndns);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct pfn *auto_pfn = namespace->pfn_settings;
 	struct ndctl_pfn *pfn, *found = NULL;
+	enum ndctl_namespace_mode mode;
 	ssize_t rc = -ENXIO;
 	char bdev[50];
 	int fd, ro;
@@ -1253,6 +1300,13 @@ static int check_pfn_autodetect(struct ndctl_bus *bus,
 
 	if (!found)
 		return -ENXIO;
+
+	mode = ndctl_namespace_get_enforce_mode(ndns);
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0))
+			&& mode != NDCTL_NS_MODE_MEMORY) {
+		fprintf(stderr, "%s expected enforce_mode pfn\n", devname);
+		return -ENXIO;
+	}
 
 	sprintf(bdev, "/dev/%s", ndctl_pfn_get_block_device(pfn));
 	fd = open(bdev, O_RDONLY);
@@ -1313,9 +1367,12 @@ static int check_dax_autodetect(struct ndctl_bus *bus,
 		struct namespace *namespace)
 {
 	struct ndctl_region *region = ndctl_namespace_get_region(ndns);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
 	const char *devname = ndctl_namespace_get_devname(ndns);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct dax *auto_dax = namespace->dax_settings;
 	struct ndctl_dax *dax, *found = NULL;
+	enum ndctl_namespace_mode mode;
 	ssize_t rc = -ENXIO;
 	char bdev[50];
 	int fd;
@@ -1340,6 +1397,13 @@ static int check_dax_autodetect(struct ndctl_bus *bus,
 
 	if (!found)
 		return -ENXIO;
+
+	mode = ndctl_namespace_get_enforce_mode(ndns);
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0))
+			&& mode != NDCTL_NS_MODE_DAX) {
+		fprintf(stderr, "%s expected enforce_mode dax\n", devname);
+		return -ENXIO;
+	}
 
 	rc = validate_dax(dax);
 	if (rc) {
@@ -1388,9 +1452,12 @@ static int check_btt_autodetect(struct ndctl_bus *bus,
 		struct namespace *namespace)
 {
 	struct ndctl_region *region = ndctl_namespace_get_region(ndns);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
 	const char *devname = ndctl_namespace_get_devname(ndns);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct btt *auto_btt = namespace->btt_settings;
 	struct ndctl_btt *btt, *found = NULL;
+	enum ndctl_namespace_mode mode;
 	ssize_t rc = -ENXIO;
 	char bdev[50];
 	int fd, ro;
@@ -1415,6 +1482,13 @@ static int check_btt_autodetect(struct ndctl_bus *bus,
 
 	if (!found)
 		return -ENXIO;
+
+	mode = ndctl_namespace_get_enforce_mode(ndns);
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0))
+			&& mode != NDCTL_NS_MODE_SAFE) {
+		fprintf(stderr, "%s expected enforce_mode btt\n", devname);
+		return -ENXIO;
+	}
 
 	sprintf(bdev, "/dev/%s", ndctl_btt_get_block_device(btt));
 	fd = open(bdev, O_RDONLY);
@@ -1455,7 +1529,15 @@ static int check_btt_autodetect(struct ndctl_bus *bus,
 	}
 
 	memset(buf, 0, 4096);
+	/* Delete both the first and second 4K pages */
 	rc = pwrite(fd, buf, 4096, 4096);
+	if (rc < 4096) {
+		rc = -ENXIO;
+		fprintf(stderr, "%s: failed to overwrite btt on %s\n",
+				devname, bdev);
+		goto out;
+	}
+	rc = pwrite(fd, buf, 4096, 0);
 	if (rc < 4096) {
 		rc = -ENXIO;
 		fprintf(stderr, "%s: failed to overwrite btt on %s\n",
@@ -1547,6 +1629,8 @@ static int validate_bdev(const char *devname, struct ndctl_btt *btt,
 static int check_namespaces(struct ndctl_region *region,
 		struct namespace **namespaces, enum ns_mode mode)
 {
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
+	struct ndctl_test *test = ndctl_get_private_data(ctx);
 	struct ndctl_bus *bus = ndctl_region_get_bus(region);
 	struct ndctl_namespace **ndns_save;
 	struct namespace *namespace;
@@ -1564,8 +1648,10 @@ static int check_namespaces(struct ndctl_region *region,
  retry:
 	ndns_save = NULL;
 	for (i = 0; (namespace = namespaces[i]); i++) {
-		struct ndctl_namespace *ndns;
 		uuid_t uu;
+		struct ndctl_namespace *ndns;
+		unsigned long _sizes[] = { 0 }, *sector_sizes = _sizes;
+		int num_sector_sizes = (int) ARRAY_SIZE(_sizes);
 
 		snprintf(devname, sizeof(devname), "namespace%d.%d",
 				ndctl_region_get_id(region), namespace->id);
@@ -1576,7 +1662,15 @@ static int check_namespaces(struct ndctl_region *region,
 			break;
 		}
 
-		for (j = 0; j < namespace->num_sector_sizes; j++) {
+		if (ndctl_region_get_type(region) == ND_DEVICE_REGION_PMEM
+				&& !ndctl_test_attempt(test, KERNEL_VERSION(4, 13, 0)))
+			/* pass, no sector_size support for pmem prior to 4.13 */;
+		else {
+			num_sector_sizes = namespace->num_sector_sizes;
+			sector_sizes = namespace->sector_sizes;
+		}
+
+		for (j = 0; j < num_sector_sizes; j++) {
 			struct btt *btt_s = NULL;
 			struct pfn *pfn_s = NULL;
 			struct dax *dax_s = NULL;
@@ -1585,7 +1679,7 @@ static int check_namespaces(struct ndctl_region *region,
 			struct ndctl_dax *dax = NULL;
 
 			rc = configure_namespace(region, ndns, namespace,
-					namespace->sector_sizes[j], mode);
+					sector_sizes[j], mode);
 			if (rc < 0) {
 				fprintf(stderr, "%s: failed to configure namespace\n",
 						devname);
@@ -1659,6 +1753,15 @@ static int check_namespaces(struct ndctl_region *region,
 				fprintf(stderr, "%s: expected size: %#llx got: %#llx\n",
 						devname, namespace->size,
 						ndctl_namespace_get_size(ndns));
+				rc = -ENXIO;
+				break;
+			}
+
+			if (sector_sizes[j] && sector_sizes[j]
+					!= ndctl_namespace_get_sector_size(ndns)) {
+				fprintf(stderr, "%s: expected lbasize: %#lx got: %#x\n",
+						devname, sector_sizes[j],
+						ndctl_namespace_get_sector_size(ndns));
 				rc = -ENXIO;
 				break;
 			}
@@ -1740,7 +1843,7 @@ static int check_namespaces(struct ndctl_region *region,
 			 * If this is the last sector size being tested, don't disable
 			 * the namespace
 			 */
-			if (j == namespace->num_sector_sizes - 1)
+			if (j == num_sector_sizes - 1)
 				break;
 
 			/*
@@ -2186,184 +2289,6 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 }
 #endif
 
-#ifdef HAVE_NDCTL_ARS
-static int check_ars_cap(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	struct ndctl_cmd *cmd;
-	int rc;
-
-	if (check->cmd != NULL) {
-		fprintf(stderr, "%s: dimm: %#x expected a NULL command, by default\n",
-				__func__, ndctl_dimm_get_handle(dimm));
-		return -ENXIO;
-	}
-
-	cmd = ndctl_bus_cmd_new_ars_cap(bus, 0, SZ_4K);
-	if (!cmd) {
-		fprintf(stderr, "%s: bus: %s failed to create cmd\n",
-				__func__, ndctl_bus_get_provider(bus));
-		return -ENOTTY;
-	}
-
-	rc = ndctl_cmd_submit(cmd);
-	if (rc) {
-		fprintf(stderr, "%s: bus: %s failed to submit cmd: %d\n",
-				__func__, ndctl_bus_get_provider(bus), rc);
-		ndctl_cmd_unref(cmd);
-		return rc;
-	}
-
-	if (ndctl_cmd_ars_cap_get_size(cmd) < sizeof(struct nd_cmd_ars_status)) {
-		fprintf(stderr, "%s: bus: %s expect size >= %zd got: %d\n",
-				__func__, ndctl_bus_get_provider(bus),
-				sizeof(struct nd_cmd_ars_status),
-				ndctl_cmd_ars_cap_get_size(cmd));
-		ndctl_cmd_unref(cmd);
-		return -ENXIO;
-	}
-
-	check->cmd = cmd;
-	return 0;
-}
-
-static int check_ars_start(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	struct ndctl_cmd *cmd_ars_cap = check_cmds[ND_CMD_ARS_CAP].cmd;
-	struct ndctl_cmd *cmd;
-	int rc;
-
-	if (check->cmd != NULL) {
-		fprintf(stderr, "%s: dimm: %#x expected a NULL command, by default\n",
-				__func__, ndctl_dimm_get_handle(dimm));
-		return -ENXIO;
-	}
-
-	cmd = ndctl_bus_cmd_new_ars_start(cmd_ars_cap, ND_ARS_PERSISTENT);
-	if (!cmd) {
-		fprintf(stderr, "%s: bus: %s failed to create cmd\n",
-				__func__, ndctl_bus_get_provider(bus));
-		return -ENOTTY;
-	}
-
-	rc = ndctl_cmd_submit(cmd);
-	if (rc) {
-		fprintf(stderr, "%s: bus: %s failed to submit cmd: %d\n",
-				__func__, ndctl_bus_get_provider(bus), rc);
-		ndctl_cmd_unref(cmd);
-		return rc;
-	}
-
-	check->cmd = cmd;
-	return 0;
-}
-
-static int check_ars_status(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	struct ndctl_cmd *cmd_ars_cap = check_cmds[ND_CMD_ARS_CAP].cmd;
-	struct ndctl_cmd *cmd;
-	unsigned long tmo = 5;
-	unsigned int i;
-	int rc;
-
-	if (check->cmd != NULL) {
-		fprintf(stderr, "%s: dimm: %#x expected a NULL command, by default\n",
-				__func__, ndctl_dimm_get_handle(dimm));
-		return -ENXIO;
-	}
-
- retry:
-	cmd = ndctl_bus_cmd_new_ars_status(cmd_ars_cap);
-	if (!cmd) {
-		fprintf(stderr, "%s: bus: %s failed to create cmd\n",
-				__func__, ndctl_bus_get_provider(bus));
-		return -ENOTTY;
-	}
-
-	rc = ndctl_cmd_submit(cmd);
-	if (rc) {
-		fprintf(stderr, "%s: bus: %s failed to submit cmd: %d\n",
-				__func__, ndctl_bus_get_provider(bus), rc);
-		ndctl_cmd_unref(cmd);
-		return rc;
-	}
-
-	if (!tmo) {
-		fprintf(stderr, "%s: bus: %s ars timeout\n", __func__,
-				ndctl_bus_get_provider(bus));
-		return -EIO;
-	}
-
-	if (ndctl_cmd_ars_in_progress(cmd)) {
-		tmo--;
-		sleep(1);
-		goto retry;
-	}
-
-	for (i = 0; i < ndctl_cmd_ars_num_records(cmd); i++) {
-		fprintf(stderr, "%s: record[%d].addr: 0x%llx\n", __func__, i,
-			ndctl_cmd_ars_get_record_addr(cmd, i));
-		fprintf(stderr, "%s: record[%d].length: 0x%llx\n", __func__, i,
-			ndctl_cmd_ars_get_record_len(cmd, i));
-	}
-
-	check->cmd = cmd;
-	return 0;
-}
-
-#ifdef HAVE_NDCTL_CLEAR_ERROR
-static int check_clear_error(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	struct ndctl_cmd *ars_cap = check_cmds[ND_CMD_ARS_CAP].cmd;
-	struct ndctl_cmd *clear_err;
-	unsigned long long cleared;
-	struct ndctl_range range;
-	int rc;
-
-	if (check->cmd != NULL) {
-		fprintf(stderr, "%s: expected a NULL command, by default\n",
-				__func__);
-		return -ENXIO;
-	}
-
-	if (ndctl_cmd_ars_cap_get_range(ars_cap, &range)) {
-		fprintf(stderr, "failed to get ars_cap range\n");
-		return -ENXIO;
-	}
-
-	clear_err = ndctl_bus_cmd_new_clear_error(range.address, SZ_4K,
-			ars_cap);
-	if (!clear_err) {
-		fprintf(stderr, "%s: bus: %s failed to create cmd\n",
-				__func__, ndctl_bus_get_provider(bus));
-		return -ENOTTY;
-	}
-
-	rc = ndctl_cmd_submit(clear_err);
-	if (rc) {
-		fprintf(stderr, "%s: bus: %s failed to submit cmd: %d\n",
-				__func__, ndctl_bus_get_provider(bus), rc);
-		ndctl_cmd_unref(clear_err);
-		return rc;
-	}
-
-	cleared = ndctl_cmd_clear_error_get_cleared(clear_err);
-	if (cleared != SZ_4K) {
-		fprintf(stderr, "%s: bus: %s expected to clear: %d actual: %lld\n",
-				__func__, ndctl_bus_get_provider(bus), SZ_4K,
-				cleared);
-		return -ENXIO;
-	}
-
-	check->cmd = clear_err;
-	return 0;
-}
-#endif /* HAVE_NDCTL_CLEAR_ERROR */
-#endif /* HAVE_NDCTL_ARS */
-
 #define BITS_PER_LONG 32
 static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		unsigned long bus_commands, unsigned long dimm_commands,
@@ -2387,16 +2312,7 @@ static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 			.test = test,
 		},
 	};
-	static struct check_cmd __check_bus_cmds[] = {
-#ifdef HAVE_NDCTL_ARS
-		[ND_CMD_ARS_CAP] = { check_ars_cap },
-		[ND_CMD_ARS_START] = { check_ars_start },
-		[ND_CMD_ARS_STATUS] = { check_ars_status },
-#ifdef HAVE_NDCTL_CLEAR_ERROR
-		[ND_CMD_CLEAR_ERROR] = { check_clear_error },
-#endif
-#endif
-	};
+
 	unsigned int i, rc = 0;
 
 	/*
@@ -2440,34 +2356,6 @@ static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 
 	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 6, 0)))
 		goto out;
-
-	/* Check Bus commands */
-	check_cmds = __check_bus_cmds;
-	for (i = 1; i < BITS_PER_LONG; i++) {
-		struct check_cmd *check = &check_cmds[i];
-
-		if ((bus_commands & (1UL << i)) == 0)
-			continue;
-		if (!ndctl_bus_is_cmd_supported(bus, i)) {
-			fprintf(stderr, "%s: bus: %s expected cmd: %s supported\n",
-					__func__,
-					ndctl_bus_get_provider(bus),
-					ndctl_bus_get_cmd_name(bus, i));
-			return -ENXIO;
-		}
-
-		if (!check->check_fn)
-			continue;
-		rc = check->check_fn(bus, dimm, check);
-		if (rc)
-			break;
-	}
-
-	for (i = 1; i < ARRAY_SIZE(__check_bus_cmds); i++) {
-		if (__check_bus_cmds[i].cmd)
-			ndctl_cmd_unref(__check_bus_cmds[i].cmd);
-		__check_bus_cmds[i].cmd = NULL;
-	}
 
  out:
 	return rc;
@@ -2620,16 +2508,21 @@ static int do_test0(struct ndctl_ctx *ctx, struct ndctl_test *test)
 	ndctl_region_foreach(bus, region)
 		ndctl_region_enable(region);
 
-	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 7, 0))) {
+	/* pfn and dax tests require vmalloc-enabled nfit_test */
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 8, 0))) {
 		rc = check_regions(bus, regions0, ARRAY_SIZE(regions0), DAX);
 		if (rc)
 			return rc;
 		reset_bus(bus);
 	}
-	rc = check_regions(bus, regions0, ARRAY_SIZE(regions0), PFN);
-	if (rc)
-		return rc;
-	reset_bus(bus);
+
+	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 8, 0))) {
+		rc = check_regions(bus, regions0, ARRAY_SIZE(regions0), PFN);
+		if (rc)
+			return rc;
+		reset_bus(bus);
+	}
+
 	return check_regions(bus, regions0, ARRAY_SIZE(regions0), BTT);
 }
 
@@ -2679,7 +2572,7 @@ int test_libndctl(int loglevel, struct ndctl_test *test, struct ndctl_ctx *ctx)
 	daxctl_set_log_priority(daxctl_ctx, loglevel);
 	ndctl_set_private_data(ctx, test);
 
-	err = nfit_test_init(&kmod_ctx, &mod, loglevel);
+	err = nfit_test_init(&kmod_ctx, &mod, loglevel, test);
 	if (err < 0) {
 		ndctl_test_skip(test);
 		fprintf(stderr, "nfit_test unavailable skipping tests\n");

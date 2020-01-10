@@ -1,5 +1,16 @@
 #!/bin/bash -x
 
+# Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+# 
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+
 DEV=""
 NDCTL="../ndctl/ndctl"
 BUS="-b nfit_test.0"
@@ -23,14 +34,16 @@ err() {
 	exit $rc
 }
 
-eval $(uname -r | awk -F. '{print "maj="$1 ";" "min="$2}')
-if [ $maj -lt 4 ]; then
-	echo "kernel $maj.$min lacks dax error handling"
-	exit $rc
-elif [ $maj -eq 4 -a $min -lt 7 ]; then
-	echo "kernel $maj.$min lacks dax error handling"
-	exit $rc
-fi
+check_min_kver()
+{
+	local ver="$1"
+	: "${KVER:=$(uname -r)}"
+
+	[ -n "$ver" ] || return 1
+	[[ "$ver" == "$(echo -e "$ver\n$KVER" | sort -V | head -1)" ]]
+}
+
+check_min_kver "4.7" || { echo "kernel $KVER may lack dax error handling"; exit $rc; }
 
 set -e
 mkdir -p $MNT

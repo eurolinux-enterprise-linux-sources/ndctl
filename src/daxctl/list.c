@@ -1,3 +1,15 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -14,7 +26,21 @@ static struct {
 	bool devs;
 	bool regions;
 	bool idle;
+	bool human;
 } list;
+
+static unsigned long listopts_to_flags(void)
+{
+	unsigned long flags = 0;
+
+	if (list.devs)
+		flags |= UTIL_JSON_DAX_DEVS;
+	if (list.idle)
+		flags |= UTIL_JSON_IDLE;
+	if (list.human)
+		flags |= UTIL_JSON_HUMAN;
+	return flags;
+}
 
 static struct {
 	const char *dev;
@@ -47,6 +73,8 @@ int cmd_list(int argc, const char **argv, void *ctx)
 		OPT_BOOLEAN('D', "devices", &list.devs, "include dax device info"),
 		OPT_BOOLEAN('R', "regions", &list.regions, "include dax region info"),
 		OPT_BOOLEAN('i', "idle", &list.idle, "include idle devices"),
+		OPT_BOOLEAN('u', "human", &list.human,
+				"use human friendly number formats "),
 		OPT_END(),
 	};
 	const char * const u[] = {
@@ -90,15 +118,15 @@ int cmd_list(int argc, const char **argv, void *ctx)
 			}
 
 			jregion = util_daxctl_region_to_json(region,
-					list.devs, param.dev, list.idle);
+					param.dev, listopts_to_flags());
 			if (!jregion) {
 				fail("\n");
 				continue;
 			}
 			json_object_array_add(jregions, jregion);
 		} else if (list.devs)
-			jdevs = util_daxctl_devs_to_list(region,
-					jdevs, param.dev, list.idle);
+			jdevs = util_daxctl_devs_to_list(region, jdevs,
+					param.dev, listopts_to_flags());
 	}
 
 	if (jregions)

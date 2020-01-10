@@ -1,4 +1,16 @@
 #!/bin/bash -x
+
+# Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+# 
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+
 DEV=""
 NDCTL="../ndctl/ndctl"
 BUS="-b nfit_test.0"
@@ -12,6 +24,17 @@ err() {
 	echo "test/create: failed at line $1"
 	exit $rc
 }
+
+check_min_kver()
+{
+	local ver="$1"
+	: "${KVER:=$(uname -r)}"
+
+	[ -n "$ver" ] || return 1
+	[[ "$ver" == "$(echo -e "$ver\n$KVER" | sort -V | head -1)" ]]
+}
+
+check_min_kver "4.5" || { echo "kernel $KVER may lack namespace mode attribute"; exit $rc; }
 
 set -e
 trap 'err $LINENO' ERR

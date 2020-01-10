@@ -1,3 +1,15 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -9,8 +21,8 @@
 struct ndctl_bus *util_bus_filter(struct ndctl_bus *bus, const char *ident)
 {
 	char *end = NULL;
-	const char *provider;
 	unsigned long bus_id, id;
+	const char *provider, *devname;
 
 	if (!ident || strcmp(ident, "all") == 0)
 		return bus;
@@ -20,12 +32,14 @@ struct ndctl_bus *util_bus_filter(struct ndctl_bus *bus, const char *ident)
 		bus_id = ULONG_MAX;
 
 	provider = ndctl_bus_get_provider(bus);
+	devname = ndctl_bus_get_devname(bus);
 	id = ndctl_bus_get_id(bus);
 
 	if (bus_id < ULONG_MAX && bus_id == id)
 		return bus;
 
-	if (bus_id == ULONG_MAX && strcmp(ident, provider) == 0)
+	if (bus_id == ULONG_MAX && (strcmp(ident, provider) == 0
+				|| strcmp(ident, devname) == 0))
 		return bus;
 
 	return NULL;
@@ -105,58 +119,119 @@ struct ndctl_dimm *util_dimm_filter(struct ndctl_dimm *dimm, const char *ident)
 struct ndctl_bus *util_bus_filter_by_dimm(struct ndctl_bus *bus,
 		const char *ident)
 {
-	char *end = NULL;
-	const char *name;
 	struct ndctl_dimm *dimm;
-	unsigned long dimm_id, id;
 
 	if (!ident || strcmp(ident, "all") == 0)
 		return bus;
 
-	dimm_id = strtoul(ident, &end, 0);
-	if (end == ident || end[0])
-		dimm_id = ULONG_MAX;
-
-	ndctl_dimm_foreach(bus, dimm) {
-		id = ndctl_dimm_get_id(dimm);
-		name = ndctl_dimm_get_devname(dimm);
-
-		if (dimm_id < ULONG_MAX && dimm_id == id)
+	ndctl_dimm_foreach(bus, dimm)
+		if (util_dimm_filter(dimm, ident))
 			return bus;
+	return NULL;
+}
 
-		if (dimm_id == ULONG_MAX && strcmp(ident, name) == 0)
+struct ndctl_bus *util_bus_filter_by_region(struct ndctl_bus *bus,
+		const char *ident)
+{
+	struct ndctl_region *region;
+
+	if (!ident || strcmp(ident, "all") == 0)
+		return bus;
+
+	ndctl_region_foreach(bus, region)
+		if (util_region_filter(region, ident))
 			return bus;
-	}
+	return NULL;
+}
 
+
+struct ndctl_bus *util_bus_filter_by_namespace(struct ndctl_bus *bus,
+		const char *ident)
+{
+	struct ndctl_region *region;
+	struct ndctl_namespace *ndns;
+
+	if (!ident || strcmp(ident, "all") == 0)
+		return bus;
+
+	ndctl_region_foreach(bus, region)
+		ndctl_namespace_foreach(region, ndns)
+			if (util_namespace_filter(ndns, ident))
+				return bus;
 	return NULL;
 }
 
 struct ndctl_region *util_region_filter_by_dimm(struct ndctl_region *region,
 		const char *ident)
 {
-	char *end = NULL;
-	const char *name;
 	struct ndctl_dimm *dimm;
-	unsigned long dimm_id, id;
 
 	if (!ident || strcmp(ident, "all") == 0)
 		return region;
 
-	dimm_id = strtoul(ident, &end, 0);
-	if (end == ident || end[0])
-		dimm_id = ULONG_MAX;
-
-	ndctl_dimm_foreach_in_region(region, dimm) {
-		id = ndctl_dimm_get_id(dimm);
-		name = ndctl_dimm_get_devname(dimm);
-
-		if (dimm_id < ULONG_MAX && dimm_id == id)
+	ndctl_dimm_foreach_in_region(region, dimm)
+		if (util_dimm_filter(dimm, ident))
 			return region;
 
-		if (dimm_id == ULONG_MAX && strcmp(ident, name) == 0)
-			return region;
+	return NULL;
+}
+
+struct ndctl_dimm *util_dimm_filter_by_region(struct ndctl_dimm *dimm,
+		const char *ident)
+{
+	struct ndctl_bus *bus = ndctl_dimm_get_bus(dimm);
+	struct ndctl_region *region;
+	struct ndctl_dimm *check;
+
+	if (!ident || strcmp(ident, "all") == 0)
+		return dimm;
+
+	ndctl_region_foreach(bus, region) {
+		if (!util_region_filter(region, ident))
+			continue;
+		ndctl_dimm_foreach_in_region(region, check)
+			if (check == dimm)
+				return dimm;
 	}
 
+	return NULL;
+}
+
+struct ndctl_dimm *util_dimm_filter_by_namespace(struct ndctl_dimm *dimm,
+		const char *ident)
+{
+	struct ndctl_bus *bus = ndctl_dimm_get_bus(dimm);
+	struct ndctl_namespace *ndns;
+	struct ndctl_region *region;
+	struct ndctl_dimm *check;
+
+	if (!ident || strcmp(ident, "all") == 0)
+		return dimm;
+
+	ndctl_region_foreach(bus, region) {
+		ndctl_namespace_foreach(region, ndns) {
+			if (!util_namespace_filter(ndns, ident))
+				continue;
+			ndctl_dimm_foreach_in_region(region, check)
+				if (check == dimm)
+					return dimm;
+		}
+	}
+
+	return NULL;
+}
+
+struct ndctl_region *util_region_filter_by_namespace(struct ndctl_region *region,
+		const char *ident)
+{
+	struct ndctl_namespace *ndns;
+
+	if (!ident || strcmp(ident, "all") == 0)
+		return region;
+
+	ndctl_namespace_foreach(region, ndns)
+		if (util_namespace_filter(ndns, ident))
+			return region;
 	return NULL;
 }
 

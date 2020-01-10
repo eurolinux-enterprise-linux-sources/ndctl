@@ -1,16 +1,16 @@
 Name:		ndctl
-Version:	56
-Release:	2%{?dist}
+Version:	58.2
+Release:	3%{?dist}
 Summary:	Manage "libnvdimm" subsystem devices (Non-volatile Memory)
 License:	GPLv2
 Group:		System Environment/Base
 Url:		https://github.com/pmem/ndctl
 Source0:	https://github.com/pmem/%{name}/archive/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
-Patch0:		22bffbe-daxctl-add-libuuid-to-the-build.patch
-Patch1:		77d84b2-ndctl-create-namespace-include-dax-info-in-operation-result.patch
-Patch2:		rhel-ndctl-limit-device-dax-to-4k-by-default.patch
-Patch3:		rhel-ndctl-document-4k-alignment-default.patch
-Patch4:		2cf2acc-libndctl-add-support-for-the-MSFT-family-of-DSM-functions.patch
+Patch0:		9dc0d66-ndctl-fix-static-analysis-report-unchecked-sscanf.patch
+Patch1:		btt_check_arenas-fix-use-of-uninitialized-variable.patch
+Patch2:		4a934b7-ndctl-list-fix-crash-when-listing-idle-device-dax-instances.patch
+Patch3:		e8700eb-btt_check_bitmap-initialize-rc.patch
+Patch4:		5443d71-dax_io-fix-unknown-parameter-handling.patch
 
 Requires:	ndctl-libs%{?_isa} = %{version}-%{release}
 Requires:	daxctl-libs%{?_isa} = %{version}-%{release}
@@ -25,6 +25,9 @@ BuildRequires:	pkgconfig(libudev)
 BuildRequires:	pkgconfig(uuid)
 BuildRequires:	pkgconfig(json-c)
 BuildRequires:	pkgconfig(bash-completion)
+%ifarch x86_64
+BuildRequires:	pkgconfig(libpmem)
+%endif
 
 %description
 Utility library for managing the "libnvdimm" subsystem.  The "libnvdimm"
@@ -100,7 +103,11 @@ control API for these devices.
 %build
 echo %{version} > version
 ./autogen.sh
+%ifarch x86_64
+%configure --disable-static --enable-local --disable-silent-rules --with-libpmem
+%else
 %configure --disable-static --enable-local --disable-silent-rules
+%endif
 make %{?_smp_mflags}
 
 %install
@@ -155,6 +162,23 @@ make check
 
 
 %changelog
+* Fri Oct 20 2017 Jeff Moyer <jmoyer@redhat.com> - 58.2-3
+- fix more static checker issues
+- Related: bz#1457566 bz#1471807 bz#1456954
+
+* Fri Oct 20 2017 Jeff Moyer <jmoyer@redhat.com> - 58.2-2
+- add in missing patch files
+- Related: bz#1457566 bz#1471807 bz#1456954
+
+* Mon Oct 16 2017 Jeff Moyer <jmoyer@redhat.com> - 58.2-1
+- rebase to v58.2
+- remove patches that were backported from later versions
+- we now support >4k faults, so remove rhel-only patches
+- add libpmem dependency, and gate it on x86_64
+- pull in static checker fix for uncheck sscanf result
+- fix up use of uninitialized variable
+- Related: bz#1457566 bz#1471807 bz#1456954
+
 * Tue May 30 2017 Jeff Moyer <jmoyer@redhat.com> - 56-2
 - bump release
 - Related: bz#1440902 bz#1446689

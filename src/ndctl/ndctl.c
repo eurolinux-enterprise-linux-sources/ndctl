@@ -1,3 +1,19 @@
+/*
+ * Copyright(c) 2015-2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2005 Andreas Ericsson. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ */
+
+/* originally copied from perf and git */
+
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
@@ -57,12 +73,14 @@ static struct cmd_struct commands[] = {
 	{ "disable-namespace", cmd_disable_namespace },
 	{ "create-namespace", cmd_create_namespace },
 	{ "destroy-namespace", cmd_destroy_namespace },
+	{ "check-namespace", cmd_check_namespace },
 	{ "enable-region", cmd_enable_region },
 	{ "disable-region", cmd_disable_region },
 	{ "enable-dimm", cmd_enable_dimm },
 	{ "disable-dimm", cmd_disable_dimm },
 	{ "zero-labels", cmd_zero_labels },
 	{ "read-labels", cmd_read_labels },
+	{ "write-labels", cmd_write_labels },
 	{ "init-labels", cmd_init_labels },
 	{ "check-labels", cmd_check_labels },
 	{ "list", cmd_list },

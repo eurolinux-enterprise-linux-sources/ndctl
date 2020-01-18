@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0
+
+ndctl-update-firmware(1)
+========================
+
+NAME
+----
+ndctl-update-firmware - provides for updating the firmware on an NVDIMM
+
+SYNOPSIS
+--------
+[verse]
+'ndctl update-firmware' <dimm> [<options>]
+
+DESCRIPTION
+-----------
+Provide a generic interface for updating NVDIMM firmware. The use of this
+depends on support from the underlying libndctl, kernel, as well as the
+platform itself.
+
+
+OPTIONS
+-------
+<dimm>::
+include::xable-dimm-options.txt[]
+
+-f::
+--firmware::
+	firmware file used to perform the update
+
+-v::
+--verbose::
+        Emit debug messages for the namespace check process.
+
+include::../copyright.txt[]

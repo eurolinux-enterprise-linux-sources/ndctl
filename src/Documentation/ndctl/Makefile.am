@@ -9,13 +9,26 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 # General Public License for more details.
 
-do_subst = sed -e 's,UTILITY,ndctl,g'
+if USE_ASCIIDOCTOR
 
+do_subst = sed -e 's,@Utility@,Ndctl,g' -e's,@utility@,ndctl,g'
+CONFFILE = asciidoctor-extensions.rb
+asciidoctor-extensions.rb: ../asciidoctor-extensions.rb.in
+	$(AM_V_GEN) $(do_subst) < $< > $@
+
+else
+
+do_subst = sed -e 's,UTILITY,ndctl,g'
+CONFFILE = asciidoc.conf
 asciidoc.conf: ../asciidoc.conf.in
 	$(AM_V_GEN) $(do_subst) < $< > $@
 
+endif
+
 man1_MANS = \
 	ndctl.1 \
+	ndctl-wait-scrub.1 \
+	ndctl-start-scrub.1 \
 	ndctl-zero-labels.1 \
 	ndctl-read-labels.1 \
 	ndctl-write-labels.1 \
@@ -30,23 +43,41 @@ man1_MANS = \
 	ndctl-create-namespace.1 \
 	ndctl-destroy-namespace.1 \
 	ndctl-check-namespace.1 \
-	ndctl-list.1
+	ndctl-inject-error.1 \
+	ndctl-inject-smart.1 \
+	ndctl-update-firmware.1 \
+	ndctl-list.1 \
+	ndctl-monitor.1
 
 CLEANFILES = $(man1_MANS)
 
 XML_DEPS = \
 	../../version.m4 \
 	Makefile \
-	asciidoc.conf \
+	$(CONFFILE) \
+	../copyright.txt \
 	region-description.txt \
 	xable-region-options.txt \
 	dimm-description.txt \
 	xable-dimm-options.txt \
 	xable-namespace-options.txt \
+	ars-description.txt \
 	labels-description.txt \
 	labels-options.txt
 
 RM ?= rm -f
+
+if USE_ASCIIDOCTOR
+
+%.1: %.txt $(XML_DEPS)
+	$(AM_V_GEN)$(RM) $@+ $@ && \
+		$(ASCIIDOC) -b manpage -d manpage -acompat-mode \
+		-I. -rasciidoctor-extensions \
+		-amansource=ndctl -amanmanual="ndctl Manual" \
+		-andctl_version=$(VERSION) -o $@+ $< && \
+		mv $@+ $@
+
+else
 
 %.xml: %.txt $(XML_DEPS)
 	$(AM_V_GEN)$(RM) $@+ $@ && \
@@ -54,6 +85,8 @@ RM ?= rm -f
 		--unsafe -andctl_version=$(VERSION) -o $@+ $< && \
 		mv $@+ $@
 
-%.1: %.xml
+%.1: %.xml $(XML_DEPS)
 	$(AM_V_GEN)$(RM) $@ && \
 		$(XMLTO) -o . -m ../manpage-normal.xsl man $<
+
+endif

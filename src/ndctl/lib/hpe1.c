@@ -36,6 +36,12 @@ static struct ndctl_cmd *hpe1_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
 		return NULL;
 	}
 
+	if (test_dimm_dsm(dimm, NDN_HPE1_CMD_SMART)
+			== DIMM_DSM_UNSUPPORTED) {
+		dbg(ctx, "unsupported function\n");
+		return NULL;
+	}
+
 	size = sizeof(*cmd) + sizeof(struct ndn_pkg_hpe1);
 	cmd = calloc(1, size);
 	if (!cmd)
@@ -128,7 +134,7 @@ static unsigned int hpe1_cmd_smart_get_health(struct ndctl_cmd *cmd)
 	return health;
 }
 
-static unsigned int hpe1_cmd_smart_get_temperature(struct ndctl_cmd *cmd)
+static unsigned int hpe1_cmd_smart_get_media_temperature(struct ndctl_cmd *cmd)
 {
 	if (hpe1_smart_valid(cmd) < 0)
 		return UINT_MAX;
@@ -214,6 +220,12 @@ static struct ndctl_cmd *hpe1_dimm_cmd_new_smart_threshold(struct ndctl_dimm *di
 		return NULL;
 	}
 
+	if (test_dimm_dsm(dimm, NDN_HPE1_CMD_SMART_THRESHOLD)
+			== DIMM_DSM_UNSUPPORTED) {
+		dbg(ctx, "unsupported function\n");
+		return NULL;
+	}
+
 	size = sizeof(*cmd) + sizeof(struct ndn_pkg_hpe1);
 	cmd = calloc(1, size);
 	if (!cmd)
@@ -267,7 +279,8 @@ static unsigned int hpe1_cmd_smart_threshold_get_alarm_control(struct ndctl_cmd 
 	return flags;
 }
 
-static unsigned int hpe1_cmd_smart_threshold_get_temperature(struct ndctl_cmd *cmd)
+static unsigned int hpe1_cmd_smart_threshold_get_media_temperature(
+		struct ndctl_cmd *cmd)
 {
 	if (hpe1_smart_threshold_valid(cmd) < 0)
 		return UINT_MAX;
@@ -283,11 +296,11 @@ static unsigned int hpe1_cmd_smart_threshold_get_spares(struct ndctl_cmd *cmd)
 	return CMD_HPE1_SMART_THRESH(cmd)->spare_block_threshold;
 }
 
-struct ndctl_smart_ops * const hpe1_smart_ops = &(struct ndctl_smart_ops) {
+struct ndctl_dimm_ops * const hpe1_dimm_ops = &(struct ndctl_dimm_ops) {
 	.new_smart = hpe1_dimm_cmd_new_smart,
 	.smart_get_flags = hpe1_cmd_smart_get_flags,
 	.smart_get_health = hpe1_cmd_smart_get_health,
-	.smart_get_temperature = hpe1_cmd_smart_get_temperature,
+	.smart_get_media_temperature = hpe1_cmd_smart_get_media_temperature,
 	.smart_get_spares = hpe1_cmd_smart_get_spares,
 	.smart_get_alarm_flags = hpe1_cmd_smart_get_alarm_flags,
 	.smart_get_life_used = hpe1_cmd_smart_get_life_used,
@@ -296,6 +309,7 @@ struct ndctl_smart_ops * const hpe1_smart_ops = &(struct ndctl_smart_ops) {
 	.smart_get_vendor_data = hpe1_cmd_smart_get_vendor_data,
 	.new_smart_threshold = hpe1_dimm_cmd_new_smart_threshold,
 	.smart_threshold_get_alarm_control = hpe1_cmd_smart_threshold_get_alarm_control,
-	.smart_threshold_get_temperature = hpe1_cmd_smart_threshold_get_temperature,
+	.smart_threshold_get_media_temperature =
+		hpe1_cmd_smart_threshold_get_media_temperature,
 	.smart_threshold_get_spares = hpe1_cmd_smart_threshold_get_spares,
 };

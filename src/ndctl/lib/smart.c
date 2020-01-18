@@ -17,13 +17,14 @@
 #include "private.h"
 
 /*
- * Define the wrappers around the ndctl_smart_ops:
+ * Define the wrappers around the ndctl_dimm_ops:
  */
 
 NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_smart(
 		struct ndctl_dimm *dimm)
 {
-	struct ndctl_smart_ops *ops = ndctl_dimm_get_smart_ops(dimm);
+	struct ndctl_dimm_ops *ops = dimm->ops;
+
 	if (ops && ops->new_smart)
 		return ops->new_smart(dimm);
 	else
@@ -33,173 +34,152 @@ NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_smart(
 NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_smart_threshold(
 		struct ndctl_dimm *dimm)
 {
-	struct ndctl_smart_ops *ops = ndctl_dimm_get_smart_ops(dimm);
+	struct ndctl_dimm_ops *ops = dimm->ops;
+
 	if (ops && ops->new_smart_threshold)
 		return ops->new_smart_threshold(dimm);
 	else
 		return NULL;
 }
 
-#define smart_cmd_op(name, op, rettype, defretvalue) \
-NDCTL_EXPORT rettype name(struct ndctl_cmd *cmd) \
+/*
+ * smart_set_threshold is a read-modify-write command it depends on a
+ * successfully completed smart_threshold command for its defaults.
+ */
+NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_smart_set_threshold(
+		struct ndctl_cmd *cmd)
+{
+	struct ndctl_dimm_ops *ops;
+
+	if (!cmd || !cmd->dimm)
+		return NULL;
+	ops = cmd->dimm->ops;
+
+	if (ops && ops->new_smart_set_threshold)
+		return ops->new_smart_set_threshold(cmd);
+	else
+		return NULL;
+}
+
+#define smart_cmd_op(op, rettype, defretvalue) \
+NDCTL_EXPORT rettype ndctl_cmd_##op(struct ndctl_cmd *cmd) \
 { \
 	if (cmd->dimm) { \
-		struct ndctl_smart_ops *ops = ndctl_dimm_get_smart_ops(cmd->dimm); \
+		struct ndctl_dimm_ops *ops = cmd->dimm->ops; \
 		if (ops && ops->op) \
 			return ops->op(cmd); \
 	} \
 	return defretvalue; \
 }
 
-smart_cmd_op(ndctl_cmd_smart_get_flags, smart_get_flags, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_health, smart_get_health, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_temperature, smart_get_temperature, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_spares, smart_get_spares, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_alarm_flags, smart_get_alarm_flags, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_life_used, smart_get_life_used, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_shutdown_state, smart_get_shutdown_state, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_vendor_size, smart_get_vendor_size, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_get_vendor_data, smart_get_vendor_data, unsigned char *, NULL)
-smart_cmd_op(ndctl_cmd_smart_threshold_get_alarm_control, smart_threshold_get_alarm_control, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_threshold_get_temperature, smart_threshold_get_temperature, unsigned int, 0)
-smart_cmd_op(ndctl_cmd_smart_threshold_get_spares, smart_threshold_get_spares, unsigned int, 0)
+smart_cmd_op(smart_get_flags, unsigned int, 0)
+smart_cmd_op(smart_get_health, unsigned int, 0)
+smart_cmd_op(smart_get_media_temperature, unsigned int, 0)
+smart_cmd_op(smart_get_ctrl_temperature, unsigned int, 0)
+smart_cmd_op(smart_get_spares, unsigned int, 0)
+smart_cmd_op(smart_get_alarm_flags, unsigned int, 0)
+smart_cmd_op(smart_get_life_used, unsigned int, 0)
+smart_cmd_op(smart_get_shutdown_state, unsigned int, 0)
+smart_cmd_op(smart_get_shutdown_count, unsigned int, 0)
+smart_cmd_op(smart_get_vendor_size, unsigned int, 0)
+smart_cmd_op(smart_get_vendor_data, unsigned char *, NULL)
+smart_cmd_op(smart_threshold_get_alarm_control, unsigned int, 0)
+smart_cmd_op(smart_threshold_get_media_temperature, unsigned int, 0)
+smart_cmd_op(smart_threshold_get_ctrl_temperature, unsigned int, 0)
+smart_cmd_op(smart_threshold_get_spares, unsigned int, 0)
 
-/*
- * The following intel_dimm_*() and intel_smart_*() functions implement
- * the ndctl_smart_ops for the Intel DSM family (NVDIMM_FAMILY_INTEL):
- */
-
-static struct ndctl_cmd *intel_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
+NDCTL_EXPORT unsigned int ndctl_cmd_smart_get_temperature(struct ndctl_cmd *cmd)
 {
-	struct ndctl_bus *bus = ndctl_dimm_get_bus(dimm);
-	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
-	struct ndctl_cmd *cmd;
-	size_t size;
-
-	BUILD_ASSERT(sizeof(struct nd_smart_payload) == 128);
-
-	if (!ndctl_dimm_is_cmd_supported(dimm, ND_CMD_SMART)) {
-		dbg(ctx, "unsupported cmd\n");
-		return NULL;
-	}
-
-	size = sizeof(*cmd) + sizeof(struct nd_cmd_smart);
-	cmd = calloc(1, size);
-	if (!cmd)
-		return NULL;
-
-	cmd->dimm = dimm;
-	ndctl_cmd_ref(cmd);
-	cmd->type = ND_CMD_SMART;
-	cmd->size = size;
-	cmd->status = 1;
-	cmd->firmware_status = &cmd->smart->status;
-
-	return cmd;
+	return ndctl_cmd_smart_get_media_temperature(cmd);
 }
 
-static int intel_smart_valid(struct ndctl_cmd *cmd)
+NDCTL_EXPORT unsigned int ndctl_cmd_smart_threshold_get_temperature(
+		struct ndctl_cmd *cmd)
 {
-	if (cmd->type != ND_CMD_SMART || cmd->status != 0)
-		return cmd->status < 0 ? cmd->status : -EINVAL;
-	return 0;
+	return ndctl_cmd_smart_threshold_get_media_temperature(cmd);
 }
 
-#define intel_smart_get_field(cmd, field) \
-static unsigned int intel_cmd_smart_get_##field(struct ndctl_cmd *cmd) \
+smart_cmd_op(smart_threshold_get_supported_alarms, unsigned int, 0);
+
+#define smart_cmd_set_op(op) \
+NDCTL_EXPORT int ndctl_cmd_##op(struct ndctl_cmd *cmd, unsigned int val) \
 { \
-	struct nd_smart_payload *smart_data; \
-	if (intel_smart_valid(cmd) < 0) \
-		return UINT_MAX; \
-	smart_data = (struct nd_smart_payload *) cmd->smart->data; \
-	return smart_data->field; \
+	if (cmd->dimm) { \
+		struct ndctl_dimm_ops *ops = cmd->dimm->ops; \
+		if (ops && ops->op) \
+			return ops->op(cmd, val); \
+	} \
+	return -ENXIO; \
 }
 
-intel_smart_get_field(cmd, flags)
-intel_smart_get_field(cmd, health)
-intel_smart_get_field(cmd, temperature)
-intel_smart_get_field(cmd, spares)
-intel_smart_get_field(cmd, alarm_flags)
-intel_smart_get_field(cmd, life_used)
-intel_smart_get_field(cmd, shutdown_state)
-intel_smart_get_field(cmd, vendor_size)
+smart_cmd_set_op(smart_threshold_set_alarm_control)
+smart_cmd_set_op(smart_threshold_set_media_temperature)
+smart_cmd_set_op(smart_threshold_set_ctrl_temperature)
+smart_cmd_set_op(smart_threshold_set_spares)
 
-static unsigned char *intel_cmd_smart_get_vendor_data(struct ndctl_cmd *cmd)
+NDCTL_EXPORT int ndctl_cmd_smart_threshold_set_temperature(
+		struct ndctl_cmd *cmd, unsigned int val)
 {
-	struct nd_smart_payload *smart_data;
-
-	if (intel_smart_valid(cmd) < 0)
-		return NULL;
-	smart_data = (struct nd_smart_payload *) cmd->smart->data;
-	return (unsigned char *) smart_data->vendor_data;
+	return ndctl_cmd_smart_threshold_set_media_temperature(cmd, val);
 }
 
-static int intel_smart_threshold_valid(struct ndctl_cmd *cmd)
-{
-	if (cmd->type != ND_CMD_SMART_THRESHOLD || cmd->status != 0)
-		return cmd->status < 0 ? cmd->status : -EINVAL;
-	return 0;
-}
-
-#define intel_smart_threshold_get_field(cmd, field) \
-static unsigned int intel_cmd_smart_threshold_get_##field( \
-			struct ndctl_cmd *cmd) \
-{ \
-	struct nd_smart_threshold_payload *smart_t_data; \
-	if (intel_smart_threshold_valid(cmd) < 0) \
-		return UINT_MAX; \
-	smart_t_data = (struct nd_smart_threshold_payload *) \
-			cmd->smart_t->data; \
-	return smart_t_data->field; \
-}
-
-intel_smart_threshold_get_field(cmd, alarm_control)
-intel_smart_threshold_get_field(cmd, temperature)
-intel_smart_threshold_get_field(cmd, spares)
-
-static struct ndctl_cmd *intel_dimm_cmd_new_smart_threshold(
+NDCTL_EXPORT struct ndctl_cmd *ndctl_dimm_cmd_new_smart_inject(
 		struct ndctl_dimm *dimm)
 {
-	struct ndctl_bus *bus = ndctl_dimm_get_bus(dimm);
-	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
-	struct ndctl_cmd *cmd;
-	size_t size;
+	struct ndctl_dimm_ops *ops = dimm->ops;
 
-	BUILD_ASSERT(sizeof(struct nd_smart_threshold_payload) == 8);
-
-	if (!ndctl_dimm_is_cmd_supported(dimm, ND_CMD_SMART_THRESHOLD)) {
-		dbg(ctx, "unsupported cmd\n");
+	if (ops && ops->new_smart_inject)
+		return ops->new_smart_inject(dimm);
+	else
 		return NULL;
-	}
-
-	size = sizeof(*cmd) + sizeof(struct nd_cmd_smart_threshold);
-	cmd = calloc(1, size);
-	if (!cmd)
-		return NULL;
-
-	cmd->dimm = dimm;
-	ndctl_cmd_ref(cmd);
-	cmd->type = ND_CMD_SMART_THRESHOLD;
-	cmd->size = size;
-	cmd->status = 1;
-	cmd->firmware_status = &cmd->smart_t->status;
-
-	return cmd;
 }
 
-struct ndctl_smart_ops * const intel_smart_ops = &(struct ndctl_smart_ops) {
-	.new_smart = intel_dimm_cmd_new_smart,
-	.smart_get_flags = intel_cmd_smart_get_flags,
-	.smart_get_health = intel_cmd_smart_get_health,
-	.smart_get_temperature = intel_cmd_smart_get_temperature,
-	.smart_get_spares = intel_cmd_smart_get_spares,
-	.smart_get_alarm_flags = intel_cmd_smart_get_alarm_flags,
-	.smart_get_life_used = intel_cmd_smart_get_life_used,
-	.smart_get_shutdown_state = intel_cmd_smart_get_shutdown_state,
-	.smart_get_vendor_size = intel_cmd_smart_get_vendor_size,
-	.smart_get_vendor_data = intel_cmd_smart_get_vendor_data,
-	.new_smart_threshold = intel_dimm_cmd_new_smart_threshold,
-	.smart_threshold_get_alarm_control = intel_cmd_smart_threshold_get_alarm_control,
-	.smart_threshold_get_temperature = intel_cmd_smart_threshold_get_temperature,
-	.smart_threshold_get_spares = intel_cmd_smart_threshold_get_spares,
-};
+#define smart_cmd_inject_val(op) \
+NDCTL_EXPORT int ndctl_cmd_##op(struct ndctl_cmd *cmd, bool enable, unsigned int val) \
+{ \
+	if (cmd->dimm) { \
+		struct ndctl_dimm_ops *ops = cmd->dimm->ops; \
+		if (ops && ops->op) \
+			return ops->op(cmd, enable, val); \
+	} \
+	return -ENXIO; \
+}
+
+smart_cmd_inject_val(smart_inject_media_temperature)
+smart_cmd_inject_val(smart_inject_ctrl_temperature)
+smart_cmd_inject_val(smart_inject_spares)
+
+#define smart_cmd_inject(op) \
+NDCTL_EXPORT int ndctl_cmd_##op(struct ndctl_cmd *cmd, bool enable) \
+{ \
+	if (cmd->dimm) { \
+		struct ndctl_dimm_ops *ops = cmd->dimm->ops; \
+		if (ops && ops->op) \
+			return ops->op(cmd, enable); \
+	} \
+	return -ENXIO; \
+}
+
+smart_cmd_inject(smart_inject_fatal)
+smart_cmd_inject(smart_inject_unsafe_shutdown)
+
+NDCTL_EXPORT struct ndctl_cmd *
+ndctl_dimm_cmd_new_ack_shutdown_count(struct ndctl_dimm *dimm)
+{
+	struct ndctl_dimm_ops *ops = dimm->ops;
+
+	if (ops && ops->new_ack_shutdown_count)
+		return ops->new_ack_shutdown_count(dimm);
+	else
+		return NULL;
+}
+
+NDCTL_EXPORT int ndctl_dimm_smart_inject_supported(struct ndctl_dimm *dimm)
+{
+	struct ndctl_dimm_ops *ops = dimm->ops;
+
+	if (ops && ops->smart_inject_supported)
+		return ops->smart_inject_supported(dimm);
+	else
+		return -ENOTTY;
+}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 ndctl-init-labels(1)
 ====================
 
@@ -24,7 +26,7 @@ the DIMM.
 EXAMPLE
 -------
 Find the DIMMs that comprise a given region:
-[verse]
+----
 # ndctl list -RD --region=region1
 {
   "dimms":[
@@ -49,23 +51,28 @@ Find the DIMMs that comprise a given region:
     }
   ]
 }
+----
 
 Disable that region so the DIMM label area can be written from
 userspace:
-[verse]
+----
 # ndctl disable-region region1
+----
 
 Initialize labels:
-[verse]
+----
 # ndctl init-labels nmem0
+----
 
 Re-enable the region:
-[verse]
+----
 # ndctl enable-region region1
+----
 
 Create a namespace in that region:
-[verse]
+----
 # ndctl create-namespace --region=region1
+----
 
 OPTIONS
 -------
@@ -76,14 +83,14 @@ include::labels-options.txt[]
 	be an existing / valid namespace index.  Warning, this will
 	destroy all defined namespaces on the dimm.
 
-COPYRIGHT
----------
-Copyright (c) 2016 - 2017, Intel Corporation. License GPLv2: GNU GPL
-version 2 <http://gnu.org/licenses/gpl.html>.  This is free software:
-you are free to change and redistribute it.  There is NO WARRANTY, to
-the extent permitted by law.
+-V::
+--label-version::
+	Initialize with a specific version of labels from the namespace
+	label specification. Defaults to 1.1
+
+include::../copyright.txt[]
 
 SEE ALSO
 --------
-http://pmem.io/documents/NVDIMM_Namespace_Spec.pdf[NVDIMM Namespace
-Specification]
+linkndctl:ndctl-create-namespace[1],
+http://www.uefi.org/sites/default/files/resources/UEFI_Spec_2_7.pdf[UEFI NVDIMM Label Protocol]

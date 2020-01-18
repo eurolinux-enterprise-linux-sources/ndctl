@@ -35,11 +35,17 @@ int cmd_read_labels(int argc, const char **argv, void *ctx);
 int cmd_write_labels(int argc, const char **argv, void *ctx);
 int cmd_init_labels(int argc, const char **argv, void *ctx);
 int cmd_check_labels(int argc, const char **argv, void *ctx);
+int cmd_inject_error(int argc, const char **argv, void *ctx);
+int cmd_wait_scrub(int argc, const char **argv, void *ctx);
+int cmd_start_scrub(int argc, const char **argv, void *ctx);
 int cmd_list(int argc, const char **argv, void *ctx);
+int cmd_monitor(int argc, const char **argv, void *ctx);
 #ifdef ENABLE_TEST
 int cmd_test(int argc, const char **argv, void *ctx);
 #endif
 #ifdef ENABLE_DESTRUCTIVE
 int cmd_bat(int argc, const char **argv, void *ctx);
 #endif
+int cmd_update_firmware(int argc, const char **argv, void *ctx);
+int cmd_inject_smart(int argc, const char **argv, void *ctx);
 #endif /* _NDCTL_BUILTIN_H_ */

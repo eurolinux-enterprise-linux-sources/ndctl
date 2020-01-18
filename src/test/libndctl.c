@@ -31,11 +31,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ndctl/libndctl.h>
 #include <daxctl/libdaxctl.h>
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
 #include <ndctl.h>
-#endif
 #include <test.h>
 
 #define BLKROGET _IO(0x12,94) /* get read-only status (0 = read_write) */
@@ -409,18 +405,10 @@ static unsigned long dimm_commands0 = 1UL << ND_CMD_GET_CONFIG_SIZE
 		| 1UL << ND_CMD_SET_CONFIG_DATA | 1UL << ND_CMD_SMART
 		| 1UL << ND_CMD_SMART_THRESHOLD;
 
-#ifdef HAVE_NDCTL_CLEAR_ERROR
 #define CLEAR_ERROR_CMDS (1UL << ND_CMD_CLEAR_ERROR)
-#else
-#define CLEAR_ERROR_CMDS 0
-#endif
 
-#ifdef HAVE_NDCTL_ARS
 #define ARS_CMDS (1UL << ND_CMD_ARS_CAP | 1UL << ND_CMD_ARS_START \
 		| 1UL << ND_CMD_ARS_STATUS)
-#else
-#define ARS_CMDS 0
-#endif
 
 static unsigned long bus_commands0 = CLEAR_ERROR_CMDS | ARS_CMDS;
 
@@ -890,7 +878,7 @@ static int __check_pfn_create(struct ndctl_region *region,
 
 	mode = ndctl_namespace_get_mode(ndns);
 	if (mode >= 0 && mode != NDCTL_NS_MODE_MEMORY)
-		fprintf(stderr, "%s: expected memory mode got: %d\n",
+		fprintf(stderr, "%s: expected fsdax mode got: %d\n",
 				devname, mode);
 
 	if (namespace->ro == (rc == 0)) {
@@ -1626,6 +1614,56 @@ static int validate_bdev(const char *devname, struct ndctl_btt *btt,
 	return rc;
 }
 
+static int validate_write_cache(struct ndctl_namespace *ndns)
+{
+	const char *devname = ndctl_namespace_get_devname(ndns);
+	int wc, mode, type, rc;
+
+	type = ndctl_namespace_get_type(ndns);
+	mode = ndctl_namespace_get_mode(ndns);
+	wc = ndctl_namespace_write_cache_is_enabled(ndns);
+
+	if ((type == ND_DEVICE_NAMESPACE_PMEM || type == ND_DEVICE_NAMESPACE_IO) &&
+			(mode == NDCTL_NS_MODE_FSDAX ||	mode == NDCTL_NS_MODE_RAW)) {
+		if (wc != 1) {
+			fprintf(stderr, "%s: expected write_cache enabled\n",
+				devname);
+			return -ENXIO;
+		}
+		rc = ndctl_namespace_disable_write_cache(ndns);
+		if (rc) {
+			fprintf(stderr, "%s: failed to disable write_cache\n",
+				devname);
+			return rc;
+		}
+		rc = ndctl_namespace_write_cache_is_enabled(ndns);
+		if (rc != 0) {
+			fprintf(stderr, "%s: write_cache could not be disabled\n",
+				devname);
+			return rc;
+		}
+		rc = ndctl_namespace_enable_write_cache(ndns);
+		if (rc) {
+			fprintf(stderr, "%s: failed to re-enable write_cache\n",
+				devname);
+			return rc;
+		}
+		rc = ndctl_namespace_write_cache_is_enabled(ndns);
+		if (rc != 1) {
+			fprintf(stderr, "%s: write_cache could not be re-enabled\n",
+				devname);
+			return rc;
+		}
+	} else {
+		if (wc == 0 || wc == 1) {
+			fprintf(stderr, "%s: expected write_cache to be absent\n",
+				devname);
+			return -ENXIO;
+		}
+	}
+	return 0;
+}
+
 static int check_namespaces(struct ndctl_region *region,
 		struct namespace **namespaces, enum ns_mode mode)
 {
@@ -1796,6 +1834,13 @@ static int check_namespaces(struct ndctl_region *region,
 			if (rc) {
 				fprintf(stderr, "%s: %s validate_%s failed\n",
 						__func__, devname, dax ? "dax" : "bdev");
+				break;
+			}
+
+			rc = validate_write_cache(ndns);
+			if (rc) {
+				fprintf(stderr, "%s: %s validate_write_cache failed\n",
+						__func__, devname);
 				break;
 			}
 
@@ -2132,11 +2177,11 @@ static int check_set_config_data(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 	return 0;
 }
 
-#ifdef HAVE_NDCTL_SMART
-#define __check_smart(dimm, cmd, field) ({ \
-	if (ndctl_cmd_smart_get_##field(cmd) != smart_data.field) { \
-		fprintf(stderr, "%s dimm: %#x expected field %#x got: %#x\n", \
-				__func__, ndctl_dimm_get_handle(dimm), \
+#define __check_smart(dimm, cmd, field, mask) ({ \
+	if ((ndctl_cmd_smart_get_##field(cmd) & mask) != smart_data.field) { \
+		fprintf(stderr, "%s dimm: %#x expected \'" #field \
+				"\' %#x got: %#x\n", __func__, \
+				ndctl_dimm_get_handle(dimm), \
 				smart_data.field, \
 				ndctl_cmd_smart_get_##field(cmd)); \
 		ndctl_cmd_unref(cmd); \
@@ -2144,10 +2189,19 @@ static int check_set_config_data(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 	} \
 })
 
+/*
+ * Note, this is not a command payload, this is just a namespace for
+ * smart parameters.
+ */
+struct smart {
+	unsigned int flags, health, temperature, spares, alarm_flags,
+		     life_used, shutdown_state, vendor_size;
+};
+
 static int check_smart(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		struct check_cmd *check)
 {
-	static const struct nd_smart_payload smart_data = {
+	static const struct smart smart_data = {
 		.flags = ND_SMART_HEALTH_VALID | ND_SMART_TEMP_VALID
 			| ND_SMART_SPARES_VALID | ND_SMART_ALARM_VALID
 			| ND_SMART_USED_VALID | ND_SMART_SHUTDOWN_VALID,
@@ -2176,40 +2230,54 @@ static int check_smart(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		return rc;
 	}
 
-	__check_smart(dimm, cmd, flags);
-	__check_smart(dimm, cmd, health);
-	__check_smart(dimm, cmd, temperature);
-	__check_smart(dimm, cmd, spares);
-	__check_smart(dimm, cmd, alarm_flags);
-	__check_smart(dimm, cmd, life_used);
-	__check_smart(dimm, cmd, shutdown_state);
-	__check_smart(dimm, cmd, vendor_size);
+	__check_smart(dimm, cmd, flags, ~ND_SMART_CTEMP_VALID);
+	__check_smart(dimm, cmd, health, -1);
+	__check_smart(dimm, cmd, temperature, -1);
+	__check_smart(dimm, cmd, spares, -1);
+	__check_smart(dimm, cmd, alarm_flags, -1);
+	__check_smart(dimm, cmd, life_used, -1);
+	__check_smart(dimm, cmd, shutdown_state, -1);
+	__check_smart(dimm, cmd, vendor_size, -1);
 
-	ndctl_cmd_unref(cmd);
+	check->cmd = cmd;
 	return 0;
 }
 
 #define __check_smart_threshold(dimm, cmd, field) ({ \
 	if (ndctl_cmd_smart_threshold_get_##field(cmd) != smart_t_data.field) { \
-		fprintf(stderr, "%s dimm: %#x expected field %#x got: %#x\n", \
-				__func__, ndctl_dimm_get_handle(dimm), \
+		fprintf(stderr, "%s dimm: %#x expected \'" #field \
+				"\' %#x got: %#x\n", __func__, \
+				ndctl_dimm_get_handle(dimm), \
 				smart_t_data.field, \
 				ndctl_cmd_smart_threshold_get_##field(cmd)); \
+		ndctl_cmd_unref(cmd_set); \
 		ndctl_cmd_unref(cmd); \
 		return -ENXIO; \
 	} \
 })
 
+/*
+ * Note, this is not a command payload, this is just a namespace for
+ * smart_threshold parameters.
+ */
+struct smart_threshold {
+	unsigned int alarm_control, media_temperature, ctrl_temperature, spares;
+};
+
 static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		struct check_cmd *check)
 {
-	static const struct nd_smart_threshold_payload smart_t_data = {
+	static const struct smart_threshold smart_t_data = {
 		.alarm_control = ND_SMART_SPARE_TRIP | ND_SMART_TEMP_TRIP,
-		.temperature = 40 * 16,
+		.media_temperature = 40 * 16,
+		.ctrl_temperature = 30 * 16,
 		.spares = 5,
 	};
 	struct ndctl_cmd *cmd = ndctl_dimm_cmd_new_smart_threshold(dimm);
+	struct ndctl_cmd *cmd_smart = check_cmds[ND_CMD_SMART].cmd;
+	struct ndctl_cmd *cmd_set;
 	struct timeval tm;
+	char buf[4096];
 	fd_set fds;
 	int rc, fd;
 
@@ -2221,6 +2289,8 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 
 	fd = ndctl_dimm_get_health_eventfd(dimm);
 	FD_ZERO(&fds);
+	FD_SET(fd, &fds);
+	rc = pread(fd, buf, sizeof(buf), 0);
 	tm.tv_sec = 0;
 	tm.tv_usec = 500;
 	rc = select(fd + 1, NULL, NULL, &fds, &tm);
@@ -2240,11 +2310,12 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		if (pid == 0) {
 			FD_ZERO(&fds);
 			FD_SET(fd, &fds);
-			tm.tv_sec = 1;
+			tm.tv_sec = 5;
 			tm.tv_usec = 0;
 			rc = select(fd + 1, NULL, NULL, &fds, &tm);
 			if (rc != 1 || !FD_ISSET(fd, &fds))
 				exit(EXIT_FAILURE);
+			rc = pread(fd, buf, sizeof(buf), 0);
 			exit(EXIT_SUCCESS);
 		}
 	}
@@ -2257,6 +2328,57 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		return rc;
 	}
 
+	/*
+	 * The same kernel change that adds nfit_test support for this
+	 * command is the same change that moves notifications to
+	 * require set_threshold. If we fail to get a command, but the
+	 * notification fires then we are on an old kernel, otherwise
+	 * whether old kernel or new kernel the notification should
+	 * fire.
+	 */
+	cmd_set = ndctl_dimm_cmd_new_smart_set_threshold(cmd);
+	if (cmd_set) {
+
+		/*
+		 * These values got reworked when nfit_test gained
+		 * set_threshold support
+		 */
+		__check_smart_threshold(dimm, cmd, media_temperature);
+		__check_smart_threshold(dimm, cmd, ctrl_temperature);
+		__check_smart_threshold(dimm, cmd, spares);
+		__check_smart_threshold(dimm, cmd, alarm_control);
+
+
+		/*
+		 * Set all thresholds to match current values and set
+		 * all alarms.
+		 */
+		rc = ndctl_cmd_smart_threshold_set_alarm_control(cmd_set,
+				ndctl_cmd_smart_threshold_get_supported_alarms(cmd_set));
+		/* 'set_temperature' and 'set_media_temperature' are aliases */
+		rc |= ndctl_cmd_smart_threshold_set_temperature(cmd_set,
+				ndctl_cmd_smart_get_media_temperature(cmd_smart));
+		rc |= ndctl_cmd_smart_threshold_set_ctrl_temperature(cmd_set,
+				ndctl_cmd_smart_get_ctrl_temperature(cmd_smart));
+		rc |= ndctl_cmd_smart_threshold_set_spares(cmd_set,
+				ndctl_cmd_smart_get_spares(cmd_smart));
+		if (rc) {
+			fprintf(stderr, "%s: failed set threshold parameters\n",
+					__func__);
+			ndctl_cmd_unref(cmd_set);
+			return -ENXIO;
+		}
+
+		rc = ndctl_cmd_submit(cmd_set);
+		if (rc) {
+			fprintf(stderr, "%s: dimm: %#x failed to submit cmd_set: %d\n",
+					__func__, ndctl_dimm_get_handle(dimm), rc);
+			ndctl_cmd_unref(cmd_set);
+			return rc;
+		}
+		ndctl_cmd_unref(cmd_set);
+	}
+
 	if (ndctl_test_attempt(check->test, KERNEL_VERSION(4, 9, 0))) {
 		wait(&rc);
 		if (WEXITSTATUS(rc) == EXIT_FAILURE) {
@@ -2266,28 +2388,9 @@ static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
 		}
 	}
 
-	__check_smart_threshold(dimm, cmd, alarm_control);
-	__check_smart_threshold(dimm, cmd, temperature);
-	__check_smart_threshold(dimm, cmd, spares);
-
 	ndctl_cmd_unref(cmd);
 	return 0;
 }
-#else
-static int check_smart(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	fprintf(stderr, "%s: HAVE_NDCTL_SMART disabled, skipping\n", __func__);
-	return 0;
-}
-
-static int check_smart_threshold(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
-		struct check_cmd *check)
-{
-	fprintf(stderr, "%s: HAVE_NDCTL_SMART disabled, skipping\n", __func__);
-	return 0;
-}
-#endif
 
 #define BITS_PER_LONG 32
 static int check_commands(struct ndctl_bus *bus, struct ndctl_dimm *dimm,
@@ -2572,7 +2675,7 @@ int test_libndctl(int loglevel, struct ndctl_test *test, struct ndctl_ctx *ctx)
 	daxctl_set_log_priority(daxctl_ctx, loglevel);
 	ndctl_set_private_data(ctx, test);
 
-	err = nfit_test_init(&kmod_ctx, &mod, loglevel, test);
+	err = nfit_test_init(&kmod_ctx, &mod, ctx, loglevel, test);
 	if (err < 0) {
 		ndctl_test_skip(test);
 		fprintf(stderr, "nfit_test unavailable skipping tests\n");

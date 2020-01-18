@@ -23,18 +23,13 @@
 #include <syslog.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <ndctl.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
 #include <linux/version.h>
 #include <test.h>
 #include <libkmod.h>
 #include <ccan/array_size/array_size.h>
-
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
-#include <ndctl.h>
-#endif
 
 /* The purpose of this test is to verify that we can successfully do I/O to
  * multiple nd_blk namespaces that have discontiguous segments.  It first
@@ -244,7 +239,7 @@ int test_blk_namespaces(int log_level, struct ndctl_test *test,
 
 	if (!bus) {
 		fprintf(stderr, "ACPI.NFIT unavailable falling back to nfit_test\n");
-		rc = nfit_test_init(&kmod_ctx, &mod, log_level, test);
+		rc = nfit_test_init(&kmod_ctx, &mod, NULL, log_level, test);
 		ndctl_invalidate(ctx);
 		bus = ndctl_bus_get_by_provider(ctx, "nfit_test.0");
 		if (rc < 0 || !bus) {

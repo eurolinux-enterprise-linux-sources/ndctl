@@ -28,12 +28,7 @@
 #include <ndctl/libndctl.h>
 #include <ccan/array_size/array_size.h>
 
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
 #include <ndctl.h>
-#endif
-
 #include <builtin.h>
 #include <test.h>
 
@@ -265,7 +260,7 @@ int test_multi_pmem(int loglevel, struct ndctl_test *test, struct ndctl_ctx *ctx
 
 	ndctl_set_log_priority(ctx, loglevel);
 
-	err = nfit_test_init(&kmod_ctx, &mod, loglevel, test);
+	err = nfit_test_init(&kmod_ctx, &mod, NULL, loglevel, test);
 	if (err < 0) {
 		result = 77;
 		ndctl_test_skip(test);

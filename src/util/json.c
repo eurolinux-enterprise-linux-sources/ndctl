@@ -20,12 +20,8 @@
 #include <ndctl/libndctl.h>
 #include <daxctl/libdaxctl.h>
 #include <ccan/array_size/array_size.h>
-
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
+#include <ccan/short_types/short_types.h>
 #include <ndctl.h>
-#endif
 
 /* adapted from mdadm::human_size_brief() */
 static int display_size(struct json_object *jobj, struct printbuf *pbuf,
@@ -109,11 +105,13 @@ struct json_object *util_json_object_hex(unsigned long long val,
 	return jobj;
 }
 
-void util_display_json_array(FILE *f_out, struct json_object *jarray, int jflag)
+void util_display_json_array(FILE *f_out, struct json_object *jarray,
+		unsigned long flags)
 {
 	int len = json_object_array_length(jarray);
+	int jflag = JSON_C_TO_STRING_PRETTY;
 
-	if (json_object_array_length(jarray) > 1)
+	if (json_object_array_length(jarray) > 1 || !(flags & UTIL_JSON_HUMAN))
 		fprintf(f_out, "%s\n", json_object_to_json_string_ext(jarray, jflag));
 	else if (len) {
 		struct json_object *jobj;
@@ -128,6 +126,7 @@ struct json_object *util_bus_to_json(struct ndctl_bus *bus)
 {
 	struct json_object *jbus = json_object_new_object();
 	struct json_object *jobj;
+	int scrub;
 
 	if (!jbus)
 		return NULL;
@@ -141,6 +140,15 @@ struct json_object *util_bus_to_json(struct ndctl_bus *bus)
 	if (!jobj)
 		goto err;
 	json_object_object_add(jbus, "dev", jobj);
+
+	scrub = ndctl_bus_get_scrub_state(bus);
+	if (scrub < 0)
+		return jbus;
+
+	jobj = json_object_new_string(scrub ? "active" : "idle");
+	if (!jobj)
+		goto err;
+	json_object_object_add(jbus, "scrub_state", jobj);
 
 	return jbus;
  err:
@@ -374,11 +382,12 @@ static int compare_dimm_number(const void *p1, const void *p2)
 	const char *dimm2_name = ndctl_dimm_get_devname(dimm2);
 	int num1, num2;
 
-	sscanf(dimm1_name, "nmem%d", &num1);
-	sscanf(dimm2_name, "nmem%d", &num2);
+	if (sscanf(dimm1_name, "nmem%d", &num1) != 1)
+		num1 = 0;
+	if (sscanf(dimm2_name, "nmem%d", &num2) != 1)
+		num2 = 0;
 
 	return num1 - num2;
-
 }
 
 static struct json_object *badblocks_to_jdimms(struct ndctl_region *region,
@@ -643,12 +652,46 @@ static struct json_object *util_dax_badblocks_to_json(struct ndctl_dax *dax,
 			bb_count, flags);
 }
 
+static struct json_object *util_raw_uuid(struct ndctl_namespace *ndns)
+{
+	char buf[40];
+	uuid_t raw_uuid;
+
+	ndctl_namespace_get_uuid(ndns, raw_uuid);
+	if (uuid_is_null(raw_uuid))
+		return NULL;
+	uuid_unparse(raw_uuid, buf);
+	return json_object_new_string(buf);
+}
+
+static void util_raw_uuid_to_json(struct ndctl_namespace *ndns,
+				  unsigned long flags,
+				  struct json_object *jndns)
+{
+	struct json_object *jobj;
+
+	if (!(flags & UTIL_JSON_VERBOSE))
+		return;
+
+	jobj = util_raw_uuid(ndns);
+	if (!jobj)
+		return;
+	json_object_object_add(jndns, "raw_uuid", jobj);
+}
+
 struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		unsigned long flags)
 {
 	struct json_object *jndns = json_object_new_object();
+	enum ndctl_pfn_loc loc = NDCTL_PFN_LOC_NONE;
 	struct json_object *jobj, *jbbs = NULL;
+	const char *locations[] = {
+		[NDCTL_PFN_LOC_NONE] = "none",
+		[NDCTL_PFN_LOC_RAM] = "mem",
+		[NDCTL_PFN_LOC_PMEM] = "dev",
+	};
 	unsigned long long size = ULLONG_MAX;
+	unsigned int sector_size = UINT_MAX;
 	enum ndctl_namespace_mode mode;
 	const char *bdev = NULL, *name;
 	unsigned int bb_count = 0;
@@ -673,17 +716,21 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 	mode = ndctl_namespace_get_mode(ndns);
 	switch (mode) {
 	case NDCTL_NS_MODE_MEMORY:
-		if (pfn) /* dynamic memory mode */
+		if (pfn) { /* dynamic memory mode */
 			size = ndctl_pfn_get_size(pfn);
-		else /* native/static memory mode */
+			loc = ndctl_pfn_get_location(pfn);
+		} else { /* native/static memory mode */
 			size = ndctl_namespace_get_size(ndns);
-		jobj = json_object_new_string("memory");
+			loc = NDCTL_PFN_LOC_RAM;
+		}
+		jobj = json_object_new_string("fsdax");
 		break;
 	case NDCTL_NS_MODE_DAX:
 		if (!dax)
 			goto err;
 		size = ndctl_dax_get_size(dax);
-		jobj = json_object_new_string("dax");
+		jobj = json_object_new_string("devdax");
+		loc = ndctl_dax_get_location(dax);
 		break;
 	case NDCTL_NS_MODE_SAFE:
 		if (!btt)
@@ -701,6 +748,12 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 	if (jobj)
 		json_object_object_add(jndns, "mode", jobj);
 
+	if ((mode != NDCTL_NS_MODE_SAFE) && (mode != NDCTL_NS_MODE_RAW)) {
+		jobj = json_object_new_string(locations[loc]);
+		if (jobj)
+			json_object_object_add(jndns, "map", jobj);
+	}
+
 	if (size < ULLONG_MAX) {
 		jobj = util_json_object_size(size, flags);
 		if (jobj)
@@ -714,12 +767,7 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		if (!jobj)
 			goto err;
 		json_object_object_add(jndns, "uuid", jobj);
-
-		jobj = json_object_new_int(ndctl_btt_get_sector_size(btt));
-		if (!jobj)
-			goto err;
-		json_object_object_add(jndns, "sector_size", jobj);
-
+		util_raw_uuid_to_json(ndns, flags, jndns);
 		bdev = ndctl_btt_get_block_device(btt);
 	} else if (pfn) {
 		ndctl_pfn_get_uuid(pfn, uuid);
@@ -728,6 +776,7 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		if (!jobj)
 			goto err;
 		json_object_object_add(jndns, "uuid", jobj);
+		util_raw_uuid_to_json(ndns, flags, jndns);
 		bdev = ndctl_pfn_get_block_device(pfn);
 	} else if (dax) {
 		struct daxctl_region *dax_region;
@@ -739,6 +788,7 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		if (!jobj)
 			goto err;
 		json_object_object_add(jndns, "uuid", jobj);
+		util_raw_uuid_to_json(ndns, flags, jndns);
 		if ((flags & UTIL_JSON_DAX) && dax_region) {
 			jobj = util_daxctl_region_to_json(dax_region, NULL,
 					flags);
@@ -747,12 +797,18 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		} else if (dax_region) {
 			struct daxctl_dev *dev;
 
+			/*
+			 * We can only find/list these device-dax
+			 * details when the instance is enabled.
+			 */
 			dev = daxctl_dev_get_first(dax_region);
-			name = daxctl_dev_get_devname(dev);
-			jobj = json_object_new_string(name);
-			if (!jobj)
-				goto err;
-			json_object_object_add(jndns, "chardev", jobj);
+			if (dev) {
+				name = daxctl_dev_get_devname(dev);
+				jobj = json_object_new_string(name);
+				if (!jobj)
+					goto err;
+				json_object_object_add(jndns, "chardev", jobj);
+			}
 		}
 	} else if (ndctl_namespace_get_type(ndns) != ND_DEVICE_NAMESPACE_IO) {
 		ndctl_namespace_get_uuid(ndns, uuid);
@@ -764,6 +820,27 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 		bdev = ndctl_namespace_get_block_device(ndns);
 	} else
 		bdev = ndctl_namespace_get_block_device(ndns);
+
+	if (btt)
+		sector_size = ndctl_btt_get_sector_size(btt);
+	else if (!dax) {
+		sector_size = ndctl_namespace_get_sector_size(ndns);
+		if (!sector_size || sector_size == UINT_MAX)
+			sector_size = 512;
+	}
+
+	/*
+	 * The kernel will default to a 512 byte sector size on PMEM
+	 * namespaces that don't explicitly have a sector size. This
+	 * happens because they use pre-v1.2 labels or because they
+	 * don't have a label space (devtype=nd_namespace_io).
+	 */
+	if (sector_size < UINT_MAX && flags & UTIL_JSON_VERBOSE) {
+		jobj = json_object_new_int(sector_size);
+		if (!jobj)
+			goto err;
+		json_object_object_add(jndns, "sector_size", jobj);
+	}
 
 	if (bdev && bdev[0]) {
 		jobj = json_object_new_string(bdev);
@@ -788,7 +865,7 @@ struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
 	}
 
 	numa = ndctl_namespace_get_numa_node(ndns);
-	if (numa >= 0) {
+	if (numa >= 0 && flags & UTIL_JSON_VERBOSE) {
 		jobj = json_object_new_int(numa);
 		if (jobj)
 			json_object_object_add(jndns, "numa_node", jobj);
@@ -860,5 +937,30 @@ struct json_object *util_mapping_to_json(struct ndctl_mapping *mapping,
 	return jmapping;
  err:
 	json_object_put(jmapping);
+	return NULL;
+}
+
+struct json_object *util_badblock_rec_to_json(u64 block, u64 count,
+		unsigned long flags)
+{
+	struct json_object *jerr = json_object_new_object();
+	struct json_object *jobj;
+
+	if (!jerr)
+		return NULL;
+
+	jobj = util_json_object_hex(block, flags);
+	if (!jobj)
+		goto err;
+	json_object_object_add(jerr, "block", jobj);
+
+	jobj = util_json_object_hex(count, flags);
+	if (!jobj)
+		goto err;
+	json_object_object_add(jerr, "count", jobj);
+
+	return jerr;
+ err:
+	json_object_put(jerr);
 	return NULL;
 }

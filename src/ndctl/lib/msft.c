@@ -35,6 +35,11 @@ static struct ndctl_cmd *msft_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
 		return NULL;
 	}
 
+	if (test_dimm_dsm(dimm, NDN_MSFT_CMD_SMART) == DIMM_DSM_UNSUPPORTED) {
+		dbg(ctx, "unsupported function\n");
+		return NULL;
+	}
+
 	size = sizeof(*cmd) + sizeof(struct ndn_pkg_msft);
 	cmd = calloc(1, size);
 	if (!cmd)
@@ -115,7 +120,7 @@ static unsigned int msft_cmd_smart_get_health(struct ndctl_cmd *cmd)
 	return health;
 }
 
-static unsigned int msft_cmd_smart_get_temperature(struct ndctl_cmd *cmd)
+static unsigned int msft_cmd_smart_get_media_temperature(struct ndctl_cmd *cmd)
 {
 	if (msft_smart_valid(cmd) < 0)
 		return UINT_MAX;
@@ -131,10 +136,10 @@ static unsigned int msft_cmd_smart_get_life_used(struct ndctl_cmd *cmd)
 	return 100 - CMD_MSFT_SMART(cmd)->nvm_lifetime;
 }
 
-struct ndctl_smart_ops * const msft_smart_ops = &(struct ndctl_smart_ops) {
+struct ndctl_dimm_ops * const msft_dimm_ops = &(struct ndctl_dimm_ops) {
 	.new_smart = msft_dimm_cmd_new_smart,
 	.smart_get_flags = msft_cmd_smart_get_flags,
 	.smart_get_health = msft_cmd_smart_get_health,
-	.smart_get_temperature = msft_cmd_smart_get_temperature,
+	.smart_get_media_temperature = msft_cmd_smart_get_media_temperature,
 	.smart_get_life_used = msft_cmd_smart_get_life_used,
 };

@@ -58,7 +58,7 @@ static int setup_device_dax(struct ndctl_namespace *ndns, unsigned long __align)
 	struct ndctl_ctx *ctx = ndctl_namespace_get_ctx(ndns);
 	char align[32];
 	const char *argv[] = {
-		"__func__", "-v", "-m", "dax", "-M", "dev", "-f", "-a", align,
+		"__func__", "-v", "-m", "devdax", "-M", "dev", "-f", "-a", align,
 		"-e", "",
 	};
 	int argc = ARRAY_SIZE(argv);
@@ -68,13 +68,13 @@ static int setup_device_dax(struct ndctl_namespace *ndns, unsigned long __align)
 	return create_namespace(argc, argv, ctx);
 }
 
-static int setup_pmem_memory_mode(struct ndctl_namespace *ndns,
+static int setup_pmem_fsdax_mode(struct ndctl_namespace *ndns,
 		unsigned long __align)
 {
 	struct ndctl_ctx *ctx = ndctl_namespace_get_ctx(ndns);
 	char align[32];
 	const char *argv[] = {
-		"__func__", "-v", "-m", "memory", "-M", "dev", "-f", "-a",
+		"__func__", "-v", "-m", "fsdax", "-M", "dev", "-f", "-a",
 		align, "-e", "",
 	};
 	int argc = ARRAY_SIZE(argv);
@@ -97,7 +97,7 @@ static void sigbus(int sig, siginfo_t *siginfo, void *d)
  * 3.00GHz where the loop, for the align == 2M case, completes in 7500us
  * when cached and 200ms when uncached.
  */
-#define VERIFY_TIME(x) (suseconds_t) ((ALIGN(x, SZ_2M) / SZ_4K) * 30)
+#define VERIFY_TIME(x) (suseconds_t) ((ALIGN(x, SZ_2M) / SZ_4K) * 60)
 
 static int verify_data(struct daxctl_dev *dev, char *dax_buf,
 		unsigned long align, int salt, struct ndctl_test *test)
@@ -151,15 +151,6 @@ static int __test_device_dax(unsigned long align, int loglevel,
 	struct daxctl_region *dax_region;
 	char *buf, path[100], data[VERIFY_BUF_SIZE];
 
-	memset (&act, 0, sizeof(act));
-	act.sa_sigaction = sigbus;
-	act.sa_flags = SA_SIGINFO;
-
-	if (sigaction(SIGBUS, &act, 0)) {
-		perror("sigaction");
-		return 1;
-	}
-
 	ndctl_set_log_priority(ctx, loglevel);
 
 	ndns = ndctl_get_test_dev(ctx);
@@ -175,8 +166,8 @@ static int __test_device_dax(unsigned long align, int loglevel,
 	if (!ndctl_test_attempt(test, KERNEL_VERSION(4, 7, 0)))
 		return 77;
 
-	/* setup up memory mode pmem device and seed with verification data */
-	rc = setup_pmem_memory_mode(ndns, align);
+	/* setup up fsdax mode pmem device and seed with verification data */
+	rc = setup_pmem_fsdax_mode(ndns, align);
 	if (rc < 0 || !(pfn = ndctl_namespace_get_pfn(ndns))) {
 		fprintf(stderr, "%s: failed device-dax setup\n",
 				ndctl_namespace_get_devname(ndns));
@@ -276,11 +267,21 @@ static int __test_device_dax(unsigned long align, int loglevel,
 	 * otherwise not supported.
 	 */
 	if (ndctl_test_attempt(test, KERNEL_VERSION(4, 9, 0))) {
+		static const bool devdax = false;
 		int fd2;
 
 		rc = test_dax_directio(fd, align, NULL, 0);
 		if (rc) {
 			fprintf(stderr, "%s: failed dax direct-i/o\n",
+					ndctl_namespace_get_devname(ndns));
+			goto out;
+		}
+
+		fprintf(stderr, "%s: test dax poison\n",
+				ndctl_namespace_get_devname(ndns));
+		rc = test_dax_poison(test, fd, align, NULL, 0, devdax);
+		if (rc) {
+			fprintf(stderr, "%s: failed dax poison\n",
 					ndctl_namespace_get_devname(ndns));
 			goto out;
 		}
@@ -309,6 +310,15 @@ static int __test_device_dax(unsigned long align, int loglevel,
 	if (rc < 0) {
 		fprintf(stderr, "%s: failed to reset device-dax instance\n",
 				ndctl_namespace_get_devname(ndns));
+		goto out;
+	}
+
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = sigbus;
+	act.sa_flags = SA_SIGINFO;
+	if (sigaction(SIGBUS, &act, 0)) {
+		perror("sigaction");
+		rc = EXIT_FAILURE;
 		goto out;
 	}
 

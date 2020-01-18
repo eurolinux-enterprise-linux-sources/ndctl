@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <limits.h>
+
 #include <util/json.h>
 #include <util/filter.h>
 #include <json-c/json.h>
@@ -22,11 +23,7 @@
 #include <util/parse-options.h>
 #include <ccan/array_size/array_size.h>
 
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
 #include <ndctl.h>
-#endif
 
 static struct {
 	bool buses;
@@ -38,6 +35,8 @@ static struct {
 	bool dax;
 	bool media_errors;
 	bool human;
+	bool firmware;
+	int verbose;
 } list;
 
 static unsigned long listopts_to_flags(void)
@@ -52,20 +51,14 @@ static unsigned long listopts_to_flags(void)
 		flags |= UTIL_JSON_DAX | UTIL_JSON_DAX_DEVS;
 	if (list.human)
 		flags |= UTIL_JSON_HUMAN;
+	if (list.verbose)
+		flags |= UTIL_JSON_VERBOSE;
 	return flags;
 }
 
-static struct {
-	const char *bus;
-	const char *region;
-	const char *type;
-	const char *dimm;
-	const char *mode;
-	const char *namespace;
-} param;
+struct util_filter_params param;
 
 static int did_fail;
-static int jflag = JSON_C_TO_STRING_PRETTY;
 
 #define fail(fmt, ...) \
 do { \
@@ -73,78 +66,6 @@ do { \
 	fprintf(stderr, "ndctl-%s:%s:%d: " fmt, \
 			VERSION, __func__, __LINE__, ##__VA_ARGS__); \
 } while (0)
-
-static enum ndctl_namespace_mode mode_to_type(const char *mode)
-{
-	if (!mode)
-		return -ENXIO;
-
-	if (strcasecmp(param.mode, "memory") == 0)
-		return NDCTL_NS_MODE_MEMORY;
-	else if (strcasecmp(param.mode, "sector") == 0)
-		return NDCTL_NS_MODE_SAFE;
-	else if (strcasecmp(param.mode, "safe") == 0)
-		return NDCTL_NS_MODE_SAFE;
-	else if (strcasecmp(param.mode, "dax") == 0)
-		return NDCTL_NS_MODE_DAX;
-	else if (strcasecmp(param.mode, "raw") == 0)
-		return NDCTL_NS_MODE_RAW;
-
-	return NDCTL_NS_MODE_UNKNOWN;
-}
-
-static struct json_object *list_namespaces(struct ndctl_region *region,
-		struct json_object *container, struct json_object *jnamespaces,
-		bool continue_array)
-{
-	struct ndctl_namespace *ndns;
-
-	ndctl_namespace_foreach(region, ndns) {
-		enum ndctl_namespace_mode mode = ndctl_namespace_get_mode(ndns);
-		struct json_object *jndns;
-
-		/* are we emitting namespaces? */
-		if (!list.namespaces)
-			break;
-
-		if (!util_namespace_filter(ndns, param.namespace))
-			continue;
-
-		if (param.mode && mode_to_type(param.mode) != mode)
-			continue;
-
-		if (!list.idle && !ndctl_namespace_is_active(ndns))
-			continue;
-
-		if (!jnamespaces) {
-			jnamespaces = json_object_new_array();
-			if (!jnamespaces) {
-				fail("\n");
-				continue;
-			}
-
-			if (container)
-				json_object_object_add(container, "namespaces",
-						jnamespaces);
-		}
-
-		jndns = util_namespace_to_json(ndns, listopts_to_flags());
-		if (!jndns) {
-			fail("\n");
-			continue;
-		}
-
-		json_object_array_add(jnamespaces, jndns);
-	}
-
-	/*
-	 * We we are collecting namespaces anonymously across the
-	 * platform / bus
-	 */
-	if (continue_array)
-		return jnamespaces;
-	return NULL;
-}
 
 static struct json_object *region_to_json(struct ndctl_region *region,
 		unsigned long flags)
@@ -154,6 +75,9 @@ static struct json_object *region_to_json(struct ndctl_region *region,
 	struct ndctl_interleave_set *iset;
 	struct ndctl_mapping *mapping;
 	unsigned int bb_count = 0;
+	unsigned long long extent;
+	enum ndctl_persistence_domain pd;
+	int numa;
 
 	if (!jregion)
 		return NULL;
@@ -174,6 +98,14 @@ static struct json_object *region_to_json(struct ndctl_region *region,
 		goto err;
 	json_object_object_add(jregion, "available_size", jobj);
 
+	extent = ndctl_region_get_max_available_extent(region);
+	if (extent != ULLONG_MAX) {
+		jobj = util_json_object_size(extent, flags);
+		if (!jobj)
+			goto err;
+		json_object_object_add(jregion, "max_available_extent", jobj);
+	}
+
 	switch (ndctl_region_get_type(region)) {
 	case ND_DEVICE_REGION_PMEM:
 		jobj = json_object_new_string("pmem");
@@ -187,6 +119,13 @@ static struct json_object *region_to_json(struct ndctl_region *region,
 	if (!jobj)
 		goto err;
 	json_object_object_add(jregion, "type", jobj);
+
+	numa = ndctl_region_get_numa_node(region);
+	if (numa >= 0 && flags & UTIL_JSON_VERBOSE) {
+		jobj = json_object_new_int(numa);
+		if (jobj)
+			json_object_object_add(jregion, "numa_node", jobj);
+	}
 
 	iset = ndctl_region_get_interleave_set(region);
 	if (iset) {
@@ -247,12 +186,237 @@ static struct json_object *region_to_json(struct ndctl_region *region,
 	if ((flags & UTIL_JSON_MEDIA_ERRORS) && jbbs)
 		json_object_object_add(jregion, "badblocks", jbbs);
 
-	list_namespaces(region, jregion, NULL, false);
+	pd = ndctl_region_get_persistence_domain(region);
+	switch (pd) {
+	case PERSISTENCE_CPU_CACHE:
+		jobj = json_object_new_string("cpu_cache");
+		break;
+	case PERSISTENCE_MEM_CTRL:
+		jobj = json_object_new_string("memory_controller");
+		break;
+	case PERSISTENCE_NONE:
+		jobj = json_object_new_string("none");
+		break;
+	default:
+		jobj = json_object_new_string("unknown");
+		break;
+	}
+
+	if (jobj)
+		json_object_object_add(jregion, "persistence_domain", jobj);
+
 	return jregion;
  err:
 	fail("\n");
 	json_object_put(jregion);
 	return NULL;
+}
+
+static void filter_namespace(struct ndctl_namespace *ndns,
+		struct util_filter_ctx *ctx)
+{
+	struct json_object *jndns;
+	struct list_filter_arg *lfa = ctx->list;
+	struct json_object *container = lfa->jregion ? lfa->jregion : lfa->jbus;
+
+	if (!list.idle && !ndctl_namespace_is_active(ndns))
+		return;
+
+	if (!lfa->jnamespaces) {
+		lfa->jnamespaces = json_object_new_array();
+		if (!lfa->jnamespaces) {
+			fail("\n");
+			return;
+		}
+
+		if (container)
+			json_object_object_add(container, "namespaces",
+					lfa->jnamespaces);
+	}
+
+	jndns = util_namespace_to_json(ndns, lfa->flags);
+	if (!jndns) {
+		fail("\n");
+		return;
+	}
+
+	json_object_array_add(lfa->jnamespaces, jndns);
+}
+
+static bool filter_region(struct ndctl_region *region,
+		struct util_filter_ctx *ctx)
+{
+	struct list_filter_arg *lfa = ctx->list;
+	struct json_object *jbus = lfa->jbus;
+	struct json_object *jregion;
+
+	if (!list.regions)
+		return true;
+
+	if (!list.idle && !ndctl_region_is_enabled(region))
+		return true;
+
+	if (!lfa->jregions) {
+		lfa->jregions = json_object_new_array();
+		if (!lfa->jregions) {
+			fail("\n");
+			return false;
+		}
+
+		if (jbus)
+			json_object_object_add(jbus, "regions",
+					lfa->jregions);
+	}
+
+	jregion = region_to_json(region, lfa->flags);
+	if (!jregion) {
+		fail("\n");
+		return false;
+	}
+	lfa->jregion = jregion;
+
+	/*
+	 * We've started a new region, any previous jnamespaces will
+	 * have been parented to the last region. Clear out jnamespaces
+	 * so we start a new array per region.
+	 */
+	lfa->jnamespaces = NULL;
+
+	/*
+	 * Without a bus we are collecting regions anonymously across
+	 * the platform.
+	 */
+	json_object_array_add(lfa->jregions, jregion);
+	return true;
+}
+
+static void filter_dimm(struct ndctl_dimm *dimm, struct util_filter_ctx *ctx)
+{
+	struct list_filter_arg *lfa = ctx->list;
+	struct json_object *jdimm;
+
+	if (!list.idle && !ndctl_dimm_is_enabled(dimm))
+		return;
+
+	if (!lfa->jdimms) {
+		lfa->jdimms = json_object_new_array();
+		if (!lfa->jdimms) {
+			fail("\n");
+			return;
+		}
+
+		if (lfa->jbus)
+			json_object_object_add(lfa->jbus, "dimms", lfa->jdimms);
+	}
+
+	jdimm = util_dimm_to_json(dimm, lfa->flags);
+	if (!jdimm) {
+		fail("\n");
+		return;
+	}
+
+	if (list.health) {
+		struct json_object *jhealth;
+
+		jhealth = util_dimm_health_to_json(dimm);
+		if (jhealth)
+			json_object_object_add(jdimm, "health", jhealth);
+		else if (ndctl_dimm_is_cmd_supported(dimm, ND_CMD_SMART)) {
+			/*
+			 * Failed to retrieve health data from a dimm
+			 * that otherwise supports smart data retrieval
+			 * commands.
+			 */
+			fail("\n");
+			return;
+		}
+	}
+
+	if (list.firmware) {
+		struct json_object *jfirmware;
+
+		jfirmware = util_dimm_firmware_to_json(dimm, lfa->flags);
+		if (jfirmware)
+			json_object_object_add(jdimm, "firmware", jfirmware);
+	}
+
+	/*
+	 * Without a bus we are collecting dimms anonymously across the
+	 * platform.
+	 */
+	json_object_array_add(lfa->jdimms, jdimm);
+}
+
+static bool filter_bus(struct ndctl_bus *bus, struct util_filter_ctx *ctx)
+{
+	struct list_filter_arg *lfa = ctx->list;
+
+	/*
+	 * These sub-objects are local to a bus and, if present, have
+	 * been added as a child of a parent object on the last
+	 * iteration.
+	 */
+	if (lfa->jbuses) {
+		lfa->jdimms = NULL;
+		lfa->jregion = NULL;
+		lfa->jregions = NULL;
+		lfa->jnamespaces = NULL;
+	}
+
+	if (!list.buses)
+		return true;
+
+	if (!lfa->jbuses) {
+		lfa->jbuses = json_object_new_array();
+		if (!lfa->jbuses) {
+			fail("\n");
+			return false;
+		}
+	}
+
+	lfa->jbus = util_bus_to_json(bus);
+	if (!lfa->jbus) {
+		fail("\n");
+		return false;
+	}
+	json_object_array_add(lfa->jbuses, lfa->jbus);
+	return true;
+}
+
+static int list_display(struct list_filter_arg *lfa)
+{
+	struct json_object *jnamespaces = lfa->jnamespaces;
+	struct json_object *jregions = lfa->jregions;
+	struct json_object *jdimms = lfa->jdimms;
+	struct json_object *jbuses = lfa->jbuses;
+
+	if (jbuses)
+		util_display_json_array(stdout, jbuses, lfa->flags);
+	else if ((!!jdimms + !!jregions + !!jnamespaces) > 1) {
+		struct json_object *jplatform = json_object_new_object();
+
+		if (!jplatform) {
+			fail("\n");
+			return -ENOMEM;
+		}
+
+		if (jdimms)
+			json_object_object_add(jplatform, "dimms", jdimms);
+		if (jregions)
+			json_object_object_add(jplatform, "regions", jregions);
+		if (jnamespaces && !jregions)
+			json_object_object_add(jplatform, "namespaces",
+					jnamespaces);
+		printf("%s\n", json_object_to_json_string_ext(jplatform,
+					JSON_C_TO_STRING_PRETTY));
+		json_object_put(jplatform);
+	} else if (jdimms)
+		util_display_json_array(stdout, jdimms, lfa->flags);
+	else if (jregions)
+		util_display_json_array(stdout, jregions, lfa->flags);
+	else if (jnamespaces)
+		util_display_json_array(stdout, jnamespaces, lfa->flags);
+	return 0;
 }
 
 static int num_list_flags(void)
@@ -274,8 +438,11 @@ int cmd_list(int argc, const char **argv, void *ctx)
 				"filter by namespace mode"),
 		OPT_STRING('t', "type", &param.type, "region-type",
 				"filter by region-type"),
+		OPT_STRING('U', "numa-node", &param.numa_node, "numa node",
+				"filter by numa node"),
 		OPT_BOOLEAN('B', "buses", &list.buses, "include bus info"),
 		OPT_BOOLEAN('D', "dimms", &list.dimms, "include dimm info"),
+		OPT_BOOLEAN('F', "firmware", &list.firmware, "include firmware info"),
 		OPT_BOOLEAN('H', "health", &list.health, "include dimm health"),
 		OPT_BOOLEAN('R', "regions", &list.regions,
 				"include region info"),
@@ -288,30 +455,21 @@ int cmd_list(int argc, const char **argv, void *ctx)
 				"include media errors"),
 		OPT_BOOLEAN('u', "human", &list.human,
 				"use human friendly number formats "),
+		OPT_INCR('v', "verbose", &list.verbose,
+				"increase output detail"),
 		OPT_END(),
 	};
 	const char * const u[] = {
 		"ndctl list [<options>]",
 		NULL
 	};
-	struct json_object *jnamespaces = NULL;
-	struct json_object *jregions = NULL;
-	struct json_object *jdimms = NULL;
-	struct json_object *jbuses = NULL;
-	struct ndctl_bus *bus;
-	unsigned int type = 0;
-	int i;
+	struct util_filter_ctx fctx = { 0 };
+	struct list_filter_arg lfa = { 0 };
+	int i, rc;
 
         argc = parse_options(argc, argv, options, u, 0);
 	for (i = 0; i < argc; i++)
 		error("unknown parameter \"%s\"\n", argv[i]);
-	if (param.type && (strcmp(param.type, "pmem") != 0
-				&& strcmp(param.type, "blk") != 0)) {
-		error("unknown type \"%s\" must be \"pmem\" or \"blk\"\n",
-				param.type);
-		argc++;
-	}
-
 	if (argc)
 		usage_with_options(u, options);
 
@@ -323,191 +481,39 @@ int cmd_list(int argc, const char **argv, void *ctx)
 			param.mode = "dax";
 	}
 
+	switch (list.verbose) {
+	default:
+	case 3:
+		list.idle = true;
+		list.firmware = true;
+		list.health = true;
+	case 2:
+		list.dimms = true;
+		list.buses = true;
+		list.regions = true;
+	case 1:
+		list.media_errors = true;
+		list.namespaces = true;
+		list.dax = true;
+	case 0:
+		break;
+	}
+
 	if (num_list_flags() == 0)
 		list.namespaces = true;
 
-	if (param.type) {
-		if (strcmp(param.type, "pmem") == 0)
-			type = ND_DEVICE_REGION_PMEM;
-		else
-			type = ND_DEVICE_REGION_BLK;
-	}
+	fctx.filter_bus = filter_bus;
+	fctx.filter_dimm = list.dimms ? filter_dimm : NULL;
+	fctx.filter_region = filter_region;
+	fctx.filter_namespace = list.namespaces ? filter_namespace : NULL;
+	fctx.list = &lfa;
+	lfa.flags = listopts_to_flags();
 
-	if (mode_to_type(param.mode) == NDCTL_NS_MODE_UNKNOWN) {
-		error("invalid mode: '%s'\n", param.mode);
-		return -EINVAL;
-	}
+	rc = util_filter_walk(ctx, &fctx, &param);
+	if (rc)
+		return rc;
 
-	ndctl_bus_foreach(ctx, bus) {
-		struct json_object *jbus = NULL;
-		struct ndctl_region *region;
-		struct ndctl_dimm *dimm;
-
-		if (!util_bus_filter(bus, param.bus)
-				|| !util_bus_filter_by_dimm(bus, param.dimm)
-				|| !util_bus_filter_by_region(bus, param.region)
-				|| !util_bus_filter_by_namespace(bus, param.namespace))
-			continue;
-
-		if (list.buses) {
-			if (!jbuses) {
-				jbuses = json_object_new_array();
-				if (!jbuses) {
-					fail("\n");
-					continue;
-				}
-			}
-
-			jbus = util_bus_to_json(bus);
-			if (!jbus) {
-				fail("\n");
-				continue;
-			}
-			json_object_array_add(jbuses, jbus);
-		}
-
-		ndctl_dimm_foreach(bus, dimm) {
-			struct json_object *jdimm;
-
-			/* are we emitting dimms? */
-			if (!list.dimms)
-				break;
-
-			if (!util_dimm_filter(dimm, param.dimm)
-					|| !util_dimm_filter_by_region(dimm,
-						param.region)
-					|| !util_dimm_filter_by_namespace(dimm,
-						param.namespace))
-				continue;
-
-			if (!list.idle && !ndctl_dimm_is_enabled(dimm))
-				continue;
-
-			if (!jdimms) {
-				jdimms = json_object_new_array();
-				if (!jdimms) {
-					fail("\n");
-					continue;
-				}
-
-				if (jbus)
-					json_object_object_add(jbus, "dimms", jdimms);
-			}
-
-			jdimm = util_dimm_to_json(dimm, listopts_to_flags());
-			if (!jdimm) {
-				fail("\n");
-				continue;
-			}
-
-			if (list.health) {
-				struct json_object *jhealth;
-
-				jhealth = util_dimm_health_to_json(dimm);
-				if (jhealth)
-					json_object_object_add(jdimm, "health",
-							jhealth);
-				else if (ndctl_dimm_is_cmd_supported(dimm,
-							ND_CMD_SMART)) {
-					/*
-					 * Failed to retrieve health data from
-					 * a dimm that otherwise supports smart
-					 * data retrieval commands.
-					 */
-					fail("\n");
-					continue;
-				}
-			}
-
-			/*
-			 * Without a bus we are collecting dimms anonymously
-			 * across the platform.
-			 */
-			json_object_array_add(jdimms, jdimm);
-		}
-
-		ndctl_region_foreach(bus, region) {
-			struct json_object *jregion;
-
-			if (!util_region_filter(region, param.region)
-					|| !util_region_filter_by_dimm(region,
-						param.dimm)
-					|| !util_region_filter_by_namespace(region,
-						param.namespace))
-				continue;
-
-			if (type && ndctl_region_get_type(region) != type)
-				continue;
-
-			if (!list.regions) {
-				jnamespaces = list_namespaces(region, jbus,
-						jnamespaces, true);
-				continue;
-			}
-
-			if (!list.idle && !ndctl_region_is_enabled(region))
-				continue;
-
-			if (!jregions) {
-				jregions = json_object_new_array();
-				if (!jregions) {
-					fail("\n");
-					continue;
-				}
-
-				if (jbus)
-					json_object_object_add(jbus, "regions",
-							jregions);
-			}
-
-			jregion = region_to_json(region, listopts_to_flags());
-			if (!jregion) {
-				fail("\n");
-				continue;
-			}
-
-			/*
-			 * Without a bus we are collecting regions anonymously
-			 * across the platform.
-			 */
-			json_object_array_add(jregions, jregion);
-		}
-
-		if (jbuses) {
-			jdimms = NULL;
-			jregions = NULL;
-			jnamespaces = NULL;
-		}
-	}
-
-	if (jbuses)
-		util_display_json_array(stdout, jbuses, jflag);
-	else if ((!!jdimms + !!jregions + !!jnamespaces) > 1) {
-		struct json_object *jplatform = json_object_new_object();
-
-		if (!jplatform) {
-			fail("\n");
-			return -ENOMEM;
-		}
-
-		if (jdimms)
-			json_object_object_add(jplatform, "dimms", jdimms);
-		if (jregions)
-			json_object_object_add(jplatform, "regions", jregions);
-		if (jnamespaces)
-			json_object_object_add(jplatform, "namespaces",
-					jnamespaces);
-		printf("%s\n", json_object_to_json_string_ext(jplatform,
-					jflag));
-		json_object_put(jplatform);
-	} else if (jdimms)
-		util_display_json_array(stdout, jdimms, jflag);
-	else if (jregions)
-		util_display_json_array(stdout, jregions, jflag);
-	else if (jnamespaces)
-		util_display_json_array(stdout, jnamespaces, jflag);
-
-	if (did_fail)
+	if (list_display(&lfa) || did_fail)
 		return -ENOMEM;
 	return 0;
 }

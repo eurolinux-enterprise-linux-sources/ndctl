@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <ndctl/libndctl.h>
+#include <ccan/short_types/short_types.h>
 
 enum util_json_flags {
 	UTIL_JSON_IDLE = (1 << 0),
@@ -22,16 +23,20 @@ enum util_json_flags {
 	UTIL_JSON_DAX = (1 << 2),
 	UTIL_JSON_DAX_DEVS = (1 << 3),
 	UTIL_JSON_HUMAN = (1 << 4),
+	UTIL_JSON_VERBOSE = (1 << 5),
 };
 
 struct json_object;
-void util_display_json_array(FILE *f_out, struct json_object *jarray, int jflag);
+void util_display_json_array(FILE *f_out, struct json_object *jarray,
+		unsigned long flags);
 struct json_object *util_bus_to_json(struct ndctl_bus *bus);
 struct json_object *util_dimm_to_json(struct ndctl_dimm *dimm,
 		unsigned long flags);
 struct json_object *util_mapping_to_json(struct ndctl_mapping *mapping,
 		unsigned long flags);
 struct json_object *util_namespace_to_json(struct ndctl_namespace *ndns,
+		unsigned long flags);
+struct json_object *util_badblock_rec_to_json(u64 block, u64 count,
 		unsigned long flags);
 struct daxctl_region;
 struct daxctl_dev;
@@ -48,13 +53,7 @@ struct json_object *util_json_object_size(unsigned long long size,
 		unsigned long flags);
 struct json_object *util_json_object_hex(unsigned long long val,
 		unsigned long flags);
-#ifdef HAVE_NDCTL_SMART
 struct json_object *util_dimm_health_to_json(struct ndctl_dimm *dimm);
-#else
-static inline struct json_object *util_dimm_health_to_json(
-		struct ndctl_dimm *dimm)
-{
-	return NULL;
-}
-#endif
+struct json_object *util_dimm_firmware_to_json(struct ndctl_dimm *dimm,
+		unsigned long flags);
 #endif /* __NDCTL_JSON_H__ */

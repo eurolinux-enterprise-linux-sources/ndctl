@@ -42,6 +42,9 @@ bashcompletiondir = $(BASH_COMPLETION_DIR)
 dist_bashcompletion_DATA = contrib/ndctl
 endif
 
+udevrulesdir = $(UDEVDIR)/rules.d
+dist_udevrules_DATA = contrib/80-ndctl.rules
+
 noinst_LIBRARIES = libccan.a
 libccan_a_SOURCES = \
 	ccan/str/str.h \
@@ -69,6 +72,7 @@ libutil_a_SOURCES = \
 	util/strbuf.c \
 	util/wrapper.c \
 	util/filter.c \
-	util/bitmap.c
+	util/bitmap.c \
+	util/abspath.c
 
 nobase_include_HEADERS = daxctl/libdaxctl.h

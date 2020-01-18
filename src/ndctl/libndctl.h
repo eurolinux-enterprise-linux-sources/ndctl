@@ -15,8 +15,10 @@
 
 #include <stdbool.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 #ifdef HAVE_LIBUUID
 #include <uuid/uuid.h>
@@ -71,9 +73,17 @@ typedef unsigned char uuid_t[16];
 extern "C" {
 #endif
 
+#define ND_EVENT_SPARES_REMAINING	(1 << 0)
+#define ND_EVENT_MEDIA_TEMPERATURE	(1 << 1)
+#define ND_EVENT_CTRL_TEMPERATURE	(1 << 2)
+#define ND_EVENT_HEALTH_STATE		(1 << 3)
+#define ND_EVENT_UNCLEAN_SHUTDOWN	(1 << 4)
+
 size_t ndctl_min_namespace_size(void);
 size_t ndctl_sizeof_namespace_index(void);
 size_t ndctl_sizeof_namespace_label(void);
+double ndctl_decode_smart_temperature(unsigned int temp);
+unsigned int ndctl_encode_smart_temperature(double temp);
 
 struct ndctl_ctx;
 struct ndctl_ctx *ndctl_ref(struct ndctl_ctx *ctx);
@@ -92,6 +102,13 @@ int ndctl_get_log_priority(struct ndctl_ctx *ctx);
 void ndctl_set_log_priority(struct ndctl_ctx *ctx, int priority);
 void ndctl_set_userdata(struct ndctl_ctx *ctx, void *userdata);
 void *ndctl_get_userdata(struct ndctl_ctx *ctx);
+
+enum ndctl_persistence_domain {
+	PERSISTENCE_NONE = 0,
+	PERSISTENCE_MEM_CTRL = 10,
+	PERSISTENCE_CPU_CACHE = 20,
+	PERSISTENCE_UNKNOWN = INT_MAX,
+};
 
 struct ndctl_bus;
 struct ndctl_bus *ndctl_bus_get_first(struct ndctl_ctx *ctx);
@@ -112,7 +129,14 @@ int ndctl_bus_is_cmd_supported(struct ndctl_bus *bus, int cmd);
 unsigned int ndctl_bus_get_revision(struct ndctl_bus *bus);
 unsigned int ndctl_bus_get_id(struct ndctl_bus *bus);
 const char *ndctl_bus_get_provider(struct ndctl_bus *bus);
+enum ndctl_persistence_domain ndctl_bus_get_persistence_domain(
+		struct ndctl_bus *bus);
 int ndctl_bus_wait_probe(struct ndctl_bus *bus);
+int ndctl_bus_wait_for_scrub_completion(struct ndctl_bus *bus);
+unsigned int ndctl_bus_get_scrub_count(struct ndctl_bus *bus);
+int ndctl_bus_get_scrub_state(struct ndctl_bus *bus);
+int ndctl_bus_start_scrub(struct ndctl_bus *bus);
+int ndctl_bus_has_error_injection(struct ndctl_bus *bus);
 
 struct ndctl_dimm;
 struct ndctl_dimm *ndctl_dimm_get_first(struct ndctl_bus *bus);
@@ -141,6 +165,8 @@ const char *ndctl_dimm_get_unique_id(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_get_serial(struct ndctl_dimm *dimm);
 const char *ndctl_dimm_get_cmd_name(struct ndctl_dimm *dimm, int cmd);
 int ndctl_dimm_is_cmd_supported(struct ndctl_dimm *dimm, int cmd);
+int ndctl_dimm_locked(struct ndctl_dimm *dimm);
+int ndctl_dimm_aliased(struct ndctl_dimm *dimm);
 int ndctl_dimm_has_errors(struct ndctl_dimm *dimm);
 int ndctl_dimm_has_notifications(struct ndctl_dimm *dimm);
 int ndctl_dimm_failed_save(struct ndctl_dimm *dimm);
@@ -150,6 +176,10 @@ int ndctl_dimm_failed_map(struct ndctl_dimm *dimm);
 int ndctl_dimm_smart_pending(struct ndctl_dimm *dimm);
 int ndctl_dimm_failed_flush(struct ndctl_dimm *dimm);
 int ndctl_dimm_get_health_eventfd(struct ndctl_dimm *dimm);
+unsigned int ndctl_dimm_get_health(struct ndctl_dimm *dimm);
+unsigned int ndctl_dimm_get_flags(struct ndctl_dimm *dimm);
+unsigned int ndctl_dimm_get_event_flags(struct ndctl_dimm *dimm);
+int ndctl_dimm_is_flag_supported(struct ndctl_dimm *dimm, unsigned int flag);
 unsigned int ndctl_dimm_handle_get_node(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_socket(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_imc(struct ndctl_dimm *dimm);
@@ -157,7 +187,6 @@ unsigned int ndctl_dimm_handle_get_channel(struct ndctl_dimm *dimm);
 unsigned int ndctl_dimm_handle_get_dimm(struct ndctl_dimm *dimm);
 const char *ndctl_dimm_get_devname(struct ndctl_dimm *dimm);
 struct ndctl_bus *ndctl_dimm_get_bus(struct ndctl_dimm *dimm);
-struct ndctl_smart_ops *ndctl_dimm_get_smart_ops(struct ndctl_dimm *dimm);
 struct ndctl_ctx *ndctl_dimm_get_ctx(struct ndctl_dimm *dimm);
 struct ndctl_dimm *ndctl_dimm_get_by_handle(struct ndctl_bus *bus,
 		unsigned int handle);
@@ -169,8 +198,6 @@ int ndctl_dimm_disable(struct ndctl_dimm *dimm);
 int ndctl_dimm_enable(struct ndctl_dimm *dimm);
 
 struct ndctl_cmd;
-#define HAS_ARS HAVE_NDCTL_ARS
-#if HAS_ARS == 1
 struct ndctl_cmd *ndctl_bus_cmd_new_ars_cap(struct ndctl_bus *bus,
 		unsigned long long address, unsigned long long len);
 struct ndctl_cmd *ndctl_bus_cmd_new_ars_start(struct ndctl_cmd *ars_cap, int type);
@@ -188,166 +215,83 @@ unsigned long long ndctl_cmd_ars_get_record_addr(struct ndctl_cmd *ars_stat,
 		unsigned int rec_index);
 unsigned long long ndctl_cmd_ars_get_record_len(struct ndctl_cmd *ars_stat,
 		unsigned int rec_index);
-
-#define HAS_CLEAR_ERROR HAVE_NDCTL_CLEAR_ERROR
-#if HAS_CLEAR_ERROR == 1
-/*
- * clear_error requires ars_cap, so we require HAS_CLEAR_ERROR to export
- * the clear_error capability
- */
 struct ndctl_cmd *ndctl_bus_cmd_new_clear_error(unsigned long long address,
 		unsigned long long len, struct ndctl_cmd *ars_cap);
 unsigned long long ndctl_cmd_clear_error_get_cleared(
 		struct ndctl_cmd *clear_err);
-#endif
-#else /* HAS_ARS == 0 */
-static inline struct ndctl_cmd *ndctl_bus_cmd_new_ars_cap(struct ndctl_bus *bus,
-		unsigned long long address, unsigned long long len)
-{
-	return NULL;
-}
+unsigned int ndctl_cmd_ars_cap_get_clear_unit(struct ndctl_cmd *ars_cap);
+int ndctl_cmd_ars_stat_get_flag_overflow(struct ndctl_cmd *ars_stat);
 
-static inline struct ndctl_cmd *ndctl_bus_cmd_new_ars_start(
-		struct ndctl_cmd *ars_cap, int type)
-{
-	return NULL;
-}
+/*
+ * Note: ndctl_cmd_smart_get_temperature is an alias for
+ * ndctl_cmd_smart_get_temperature
+ */
 
-static inline struct ndctl_cmd *ndctl_bus_cmd_new_ars_status(
-		struct ndctl_cmd *ars_cap)
-{
-	return NULL;
-}
+/*
+ * the ndctl.h definition of these are deprecated, libndctl.h is the
+ * authoritative defintion.
+ */
+#define ND_SMART_HEALTH_VALID	(1 << 0)
+#define ND_SMART_SPARES_VALID	(1 << 1)
+#define ND_SMART_USED_VALID	(1 << 2)
+#define ND_SMART_MTEMP_VALID 	(1 << 3)
+#define ND_SMART_TEMP_VALID 	ND_SMART_MTEMP_VALID
+#define ND_SMART_CTEMP_VALID 	(1 << 4)
+#define ND_SMART_SHUTDOWN_COUNT_VALID	(1 << 5)
+#define ND_SMART_AIT_STATUS_VALID (1 << 6)
+#define ND_SMART_PTEMP_VALID	(1 << 7)
+#define ND_SMART_ALARM_VALID	(1 << 9)
+#define ND_SMART_SHUTDOWN_VALID	(1 << 10)
+#define ND_SMART_VENDOR_VALID	(1 << 11)
+#define ND_SMART_SPARE_TRIP	(1 << 0)
+#define ND_SMART_MTEMP_TRIP	(1 << 1)
+#define ND_SMART_TEMP_TRIP	ND_SMART_MTEMP_TRIP
+#define ND_SMART_CTEMP_TRIP	(1 << 2)
+#define ND_SMART_NON_CRITICAL_HEALTH	(1 << 0)
+#define ND_SMART_CRITICAL_HEALTH	(1 << 1)
+#define ND_SMART_FATAL_HEALTH		(1 << 2)
 
-static inline unsigned int ndctl_cmd_ars_cap_get_size(struct ndctl_cmd *ars_cap)
-{
-	return 0;
-}
-
-struct ndctl_range;
-static inline int ndctl_cmd_ars_cap_get_range(struct ndctl_cmd *ars_cap,
-		struct ndctl_range *range)
-{
-	return -ENXIO;
-}
-
-static inline unsigned int ndctl_cmd_ars_in_progress(struct ndctl_cmd *ars_status)
-{
-	return 0;
-}
-
-static inline unsigned int ndctl_cmd_ars_num_records(struct ndctl_cmd *ars_stat)
-{
-	return 0;
-}
-
-static inline unsigned long long ndctl_cmd_ars_get_record_addr(
-		struct ndctl_cmd *ars_stat, unsigned int rec_index)
-{
-	return 0;
-}
-
-static inline unsigned long long ndctl_cmd_ars_get_record_len(
-		struct ndctl_cmd *ars_stat, unsigned int rec_index)
-{
-	return 0;
-}
-#define HAS_CLEAR_ERROR 0
-#endif /* HAS_ARS */
-
-#if HAS_CLEAR_ERROR == 0
-static inline struct ndctl_cmd *ndctl_bus_cmd_new_clear_error(
-		unsigned long long address, unsigned long long len,
-		struct ndctl_cmd *ars_cap)
-{
-	return NULL;
-}
-
-static inline unsigned long long ndctl_cmd_clear_error_get_cleared(
-		struct ndctl_cmd *clear_err)
-{
-	return 0;
-}
-#endif
-
-#define HAS_SMART HAVE_NDCTL_SMART
-#if HAS_SMART == 1
 struct ndctl_cmd *ndctl_dimm_cmd_new_smart(struct ndctl_dimm *dimm);
 unsigned int ndctl_cmd_smart_get_flags(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_health(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_temperature(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_get_media_temperature(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_get_ctrl_temperature(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_spares(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_alarm_flags(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_life_used(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_shutdown_state(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_get_shutdown_count(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_get_vendor_size(struct ndctl_cmd *cmd);
 unsigned char *ndctl_cmd_smart_get_vendor_data(struct ndctl_cmd *cmd);
 struct ndctl_cmd *ndctl_dimm_cmd_new_smart_threshold(struct ndctl_dimm *dimm);
 unsigned int ndctl_cmd_smart_threshold_get_alarm_control(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_threshold_get_temperature(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_threshold_get_media_temperature(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_threshold_get_ctrl_temperature(struct ndctl_cmd *cmd);
 unsigned int ndctl_cmd_smart_threshold_get_spares(struct ndctl_cmd *cmd);
-#else
-static inline struct ndctl_cmd *ndctl_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
-{
-	return NULL;
-}
-static inline unsigned int ndctl_cmd_smart_get_flags(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_health(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_temperature(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_spares(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_alarm_flags(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_life_used(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_shutdown_state(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_get_vendor_size(struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned char *ndctl_cmd_smart_get_vendor_data(struct ndctl_cmd *cmd)
-{
-	return NULL;
-}
-static inline struct ndctl_cmd *ndctl_dimm_cmd_new_smart_threshold(
-		struct ndctl_dimm *dimm)
-{
-	return NULL;
-}
-static inline unsigned int ndctl_cmd_smart_threshold_get_alarm_control(
-		struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_threshold_get_temperature(
-		struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-static inline unsigned int ndctl_cmd_smart_threshold_get_spares(
-		struct ndctl_cmd *cmd)
-{
-	return 0;
-}
-#endif
+struct ndctl_cmd *ndctl_dimm_cmd_new_smart_set_threshold(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_smart_threshold_get_supported_alarms(struct ndctl_cmd *cmd);
+int ndctl_cmd_smart_threshold_set_alarm_control(struct ndctl_cmd *cmd,
+		unsigned int val);
+int ndctl_cmd_smart_threshold_set_temperature(struct ndctl_cmd *cmd,
+		unsigned int val);
+int ndctl_cmd_smart_threshold_set_media_temperature(struct ndctl_cmd *cmd,
+		unsigned int val);
+int ndctl_cmd_smart_threshold_set_ctrl_temperature(struct ndctl_cmd *cmd,
+		unsigned int val);
+int ndctl_cmd_smart_threshold_set_spares(struct ndctl_cmd *cmd,
+		unsigned int val);
+struct ndctl_cmd *ndctl_dimm_cmd_new_smart_inject(struct ndctl_dimm *dimm);
+int ndctl_cmd_smart_inject_media_temperature(struct ndctl_cmd *cmd, bool enable,
+		unsigned int mtemp);
+int ndctl_cmd_smart_inject_ctrl_temperature(struct ndctl_cmd *cmd, bool enable,
+		unsigned int ctemp);
+int ndctl_cmd_smart_inject_spares(struct ndctl_cmd *cmd, bool enable,
+		unsigned int spares);
+int ndctl_cmd_smart_inject_fatal(struct ndctl_cmd *cmd, bool enable);
+int ndctl_cmd_smart_inject_unsafe_shutdown(struct ndctl_cmd *cmd, bool enable);
+int ndctl_dimm_smart_inject_supported(struct ndctl_dimm *dimm);
 
 struct ndctl_cmd *ndctl_dimm_cmd_new_vendor_specific(struct ndctl_dimm *dimm,
 		unsigned int opcode, size_t input_size, size_t output_size);
@@ -388,6 +332,7 @@ struct badblock {
 	unsigned long long offset;
 	unsigned int len;
 };
+
 struct ndctl_region;
 struct ndctl_region *ndctl_region_get_first(struct ndctl_bus *bus);
 struct ndctl_region *ndctl_region_get_next(struct ndctl_region *region);
@@ -407,6 +352,8 @@ unsigned int ndctl_region_get_interleave_ways(struct ndctl_region *region);
 unsigned int ndctl_region_get_mappings(struct ndctl_region *region);
 unsigned long long ndctl_region_get_size(struct ndctl_region *region);
 unsigned long long ndctl_region_get_available_size(struct ndctl_region *region);
+unsigned long long ndctl_region_get_max_available_extent(
+		struct ndctl_region *region);
 unsigned int ndctl_region_get_range_index(struct ndctl_region *region);
 unsigned int ndctl_region_get_type(struct ndctl_region *region);
 struct ndctl_namespace *ndctl_region_get_namespace_seed(
@@ -423,17 +370,21 @@ struct ndctl_ctx *ndctl_region_get_ctx(struct ndctl_region *region);
 struct ndctl_dimm *ndctl_region_get_first_dimm(struct ndctl_region *region);
 struct ndctl_dimm *ndctl_region_get_next_dimm(struct ndctl_region *region,
 		struct ndctl_dimm *dimm);
+int ndctl_region_get_numa_node(struct ndctl_region *region);
 struct ndctl_region *ndctl_bus_get_region_by_physical_address(struct ndctl_bus *bus,
 		unsigned long long address);
 #define ndctl_dimm_foreach_in_region(region, dimm) \
         for (dimm = ndctl_region_get_first_dimm(region); \
              dimm != NULL; \
              dimm = ndctl_region_get_next_dimm(region, dimm))
+enum ndctl_persistence_domain ndctl_region_get_persistence_domain(
+		struct ndctl_region *region);
 int ndctl_region_is_enabled(struct ndctl_region *region);
 int ndctl_region_enable(struct ndctl_region *region);
 int ndctl_region_disable_invalidate(struct ndctl_region *region);
 int ndctl_region_disable_preserve(struct ndctl_region *region);
 void ndctl_region_cleanup(struct ndctl_region *region);
+int ndctl_region_deep_flush(struct ndctl_region *region);
 
 struct ndctl_interleave_set;
 struct ndctl_interleave_set *ndctl_region_get_interleave_set(
@@ -501,9 +452,11 @@ const char *ndctl_namespace_get_type_name(struct ndctl_namespace *ndns);
 const char *ndctl_namespace_get_block_device(struct ndctl_namespace *ndns);
 enum ndctl_namespace_mode {
 	NDCTL_NS_MODE_MEMORY,
+	NDCTL_NS_MODE_FSDAX = NDCTL_NS_MODE_MEMORY,
 	NDCTL_NS_MODE_SAFE,
 	NDCTL_NS_MODE_RAW,
 	NDCTL_NS_MODE_DAX,
+	NDCTL_NS_MODE_DEVDAX = NDCTL_NS_MODE_DAX,
 	NDCTL_NS_MODE_UNKNOWN, /* must be last entry */
 };
 enum ndctl_namespace_mode ndctl_namespace_get_mode(
@@ -539,6 +492,38 @@ int ndctl_namespace_set_sector_size(struct ndctl_namespace *ndns,
 int ndctl_namespace_get_raw_mode(struct ndctl_namespace *ndns);
 int ndctl_namespace_set_raw_mode(struct ndctl_namespace *ndns, int raw_mode);
 int ndctl_namespace_get_numa_node(struct ndctl_namespace *ndns);
+int ndctl_namespace_inject_error(struct ndctl_namespace *ndns,
+		unsigned long long block, unsigned long long count,
+		bool notify);
+int ndctl_namespace_inject_error2(struct ndctl_namespace *ndns,
+		unsigned long long block, unsigned long long count,
+		unsigned int flags);
+int ndctl_namespace_uninject_error(struct ndctl_namespace *ndns,
+		unsigned long long block, unsigned long long count);
+int ndctl_namespace_uninject_error2(struct ndctl_namespace *ndns,
+		unsigned long long block, unsigned long long count,
+		unsigned int flags);
+int ndctl_namespace_injection_status(struct ndctl_namespace *ndns);
+enum ndctl_namespace_inject_flags {
+	NDCTL_NS_INJECT_NOTIFY = 0,
+	NDCTL_NS_INJECT_SATURATE,
+};
+
+struct ndctl_bb;
+unsigned long long ndctl_bb_get_block(struct ndctl_bb *bb);
+unsigned long long ndctl_bb_get_count(struct ndctl_bb *bb);
+struct ndctl_bb *ndctl_namespace_injection_get_first_bb(
+		struct ndctl_namespace *ndns);
+struct ndctl_bb *ndctl_namespace_injection_get_next_bb(
+		struct ndctl_namespace *ndns, struct ndctl_bb *bb);
+#define ndctl_namespace_bb_foreach(ndns, bb) \
+        for (bb = ndctl_namespace_injection_get_first_bb(ndns); \
+             bb != NULL; \
+             bb = ndctl_namespace_injection_get_next_bb(ndns, bb))
+int ndctl_namespace_write_cache_is_enabled(struct ndctl_namespace *ndns);
+int ndctl_namespace_enable_write_cache(struct ndctl_namespace *ndns);
+int ndctl_namespace_disable_write_cache(struct ndctl_namespace *ndns);
+
 struct ndctl_btt;
 struct ndctl_btt *ndctl_btt_get_first(struct ndctl_region *region);
 struct ndctl_btt *ndctl_btt_get_next(struct ndctl_btt *btt);
@@ -651,6 +636,43 @@ int ndctl_dax_enable(struct ndctl_dax *dax);
 int ndctl_dax_delete(struct ndctl_dax *dax);
 int ndctl_dax_is_configured(struct ndctl_dax *dax);
 struct daxctl_region *ndctl_dax_get_daxctl_region(struct ndctl_dax *dax);
+
+enum ND_FW_STATUS {
+	FW_SUCCESS = 0,		/* success */
+	FW_ENOTSUPP,		/* not supported */
+	FW_ENOTEXIST,		/* device not exist */
+	FW_EINVAL,		/* invalid input */
+	FW_EHWERR,		/* hardware error */
+	FW_ERETRY,		/* try again */
+	FW_EUNKNOWN,		/* unknown reason */
+	FW_ENORES,		/* out of resource */
+	FW_ENOTREADY,		/* hardware not ready */
+	FW_EBUSY,		/* firmware inprogress */
+	FW_EINVAL_CTX,		/* invalid context passed in */
+	FW_ALREADY_DONE,	/* firmware already updated */
+	FW_EBADFW,		/* firmware failed verification */
+	FW_ABORTED,		/* update sequence aborted success */
+	FW_ESEQUENCE,		/* update sequence incorrect */
+};
+
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_get_info(struct ndctl_dimm *dimm);
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_start_update(struct ndctl_dimm *dimm);
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_send(struct ndctl_cmd *start,
+		unsigned int offset, unsigned int len, void *data);
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_finish(struct ndctl_cmd *start);
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_abort(struct ndctl_cmd *start);
+struct ndctl_cmd *ndctl_dimm_cmd_new_fw_finish_query(struct ndctl_cmd *start);
+unsigned int ndctl_cmd_fw_info_get_storage_size(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_fw_info_get_max_send_len(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_fw_info_get_query_interval(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_fw_info_get_max_query_time(struct ndctl_cmd *cmd);
+unsigned long long ndctl_cmd_fw_info_get_run_version(struct ndctl_cmd *cmd);
+unsigned long long ndctl_cmd_fw_info_get_updated_version(struct ndctl_cmd *cmd);
+unsigned int ndctl_cmd_fw_start_get_context(struct ndctl_cmd *cmd);
+unsigned long long ndctl_cmd_fw_fquery_get_fw_rev(struct ndctl_cmd *cmd);
+enum ND_FW_STATUS ndctl_cmd_fw_xlat_firmware_status(struct ndctl_cmd *cmd);
+struct ndctl_cmd *ndctl_dimm_cmd_new_ack_shutdown_count(struct ndctl_dimm *dimm);
+int ndctl_dimm_fw_update_supported(struct ndctl_dimm *dimm);
 
 #ifdef __cplusplus
 } /* extern "C" */

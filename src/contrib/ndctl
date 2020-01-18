@@ -91,7 +91,7 @@ __ndctlcomp()
 
 	COMPREPLY=( $( compgen -W "$1" -- "$2" ) )
 	for cword in "${COMPREPLY[@]}"; do
-		if [[ "$cword" == @(--bus|--region|--type|--mode|--size|--dimm|--reconfig|--uuid|--name|--sector-size|--map|--namespace|--input|--output|--label-version) ]]; then
+		if [[ "$cword" == @(--bus|--region|--type|--mode|--size|--dimm|--reconfig|--uuid|--name|--sector-size|--map|--namespace|--input|--output|--label-version|--align|--block|--count|--firmware|--media-temperature|--ctrl-temperature|--spares|--media-temperature-threshold|--ctrl-temperature-threshold|--spares-threshold|--media-temperature-alarm|--ctrl-temperature-alarm|--spares-alarm|--numa-node|--log|--dimm-event|--config-file) ]]; then
 			COMPREPLY[$i]="${cword}="
 		else
 			COMPREPLY[$i]="${cword} "
@@ -143,19 +143,37 @@ __ndctl_get_dimms()
 
 __ndctl_get_sector_sizes()
 {
-	if [[ "$mode_filter" == @(raw|memory) ]]; then
+	if [[ "$mode_filter" == @(raw|memory|fsdax) ]]; then
 		echo "512 4096"
-	elif [[ "$mode_filter" == @(dax) ]]; then
+	elif [[ "$mode_filter" == @(dax|devdax) ]]; then
 		return
 	else
 		echo "512 520 528 4096 4104 4160 4224"
 	fi
 }
 
+__ndctl_get_nodes()
+{
+	local nlist=""
+
+	for node in /sys/devices/system/node/node*; do
+		node="$(basename $node)"
+		if [[ $node =~ node([0-9]+) ]]; then
+			nlist="$nlist ${BASH_REMATCH[1]}"
+		else
+			continue
+		fi
+	done
+	echo "$nlist"
+}
+
+saveopts=""
 __ndctl_file_comp()
 {
 	local cur="$1"
+
 	_filedir
+	saveopts="${COMPREPLY[*]}"
 }
 __ndctl_comp_options()
 {
@@ -164,6 +182,7 @@ __ndctl_comp_options()
 
 	if [[ "$cur" == *=* ]]; then
 		local cur_subopt=${cur%%=*}
+		local cur_arg=${cur##*=}
 		case $cur_subopt in
 		--bus)
 			opts=$(__ndctl_get_buses)
@@ -183,12 +202,12 @@ __ndctl_comp_options()
 			;;
 		--type)
 			opts="pmem blk"
-			if [[ "$mode_filter" == @(dax|memory) ]]; then
+			if [[ "$mode_filter" == @(dax|memory|fsdax|devdax) ]]; then
 				opts="pmem"
 			fi
 			;;
 		--mode)
-			opts="raw sector memory dax"
+			opts="raw sector fsdax devdax"
 			if [[ "$type_filter" == "blk" ]]; then
 				opts="raw sector"
 			fi
@@ -202,17 +221,63 @@ __ndctl_comp_options()
 		--output)
 			;&
 		--input)
-			__ndctl_file_comp "${cur##*=}"
+			;&
+		--firmware)
+			__ndctl_file_comp "$cur_arg"
 			return
 			;;
 		--label-version)
 			opts="1.1 1.2"
 			;;
+		--media-temperature-alarm)
+			;&
+		--ctrl-temperature-alarm)
+			;&
+		--spares-alarm)
+			opts="on off"
+			;;
+		--numa-node)
+			opts=$(__ndctl_get_nodes)
+			;;
+		--log)
+			local my_args=( "standard" "syslog" )
+
+			__ndctl_file_comp "$cur_arg"
+			if [ -n "$cur_arg" ]; then
+				# if $cur_arg is a substring of $my_args (as
+				# determined by compgen), then we continue to
+				# manually construct opts using $my_args, but
+				# if it is not a substring (compgen returns
+				# empty), then we defer to _ndctl_file_comp
+				# and return immediately. (NOTE: subscripting
+				# of the my_args array here is fragile).
+				# If this pattern repeats, where we need to
+				# complete with filenames and some custom
+				# options, find a better way to generalize this
+				if [ -z "$(compgen -W "${my_args[*]}" -- "$cur_arg")" ]; then
+					return
+				fi
+			fi
+			opts="${my_args[*]} $saveopts"
+			;;
+		--dimm-event)
+			opts="all \
+				dimm-spares-remaining \
+				dimm-media-temperature \
+				dimm-controller-temperature \
+				dimm-health-state \
+				dimm-unclean-shutdown \
+				"
+			;;
+		--config-file)
+			__ndctl_file_comp "$cur_arg"
+			return
+			;;
 		*)
 			return
 			;;
 		esac
-		__ndctlcomp "$opts" "${cur##*=}"
+		__ndctlcomp "$opts" "$cur_arg"
 	fi
 }
 
@@ -256,6 +321,17 @@ __ndctl_comp_non_option_args()
 		;&
 	zero-labels)
 		opts="$(__ndctl_get_dimms -i) all"
+		;;
+	inject-error)
+		opts="$(__ndctl_get_ns -i)"
+		;;
+	inject-smart)
+		opts="$(__ndctl_get_dimms -i)"
+		;;
+	wait-scrub)
+		;&
+	start-scrub)
+		opts="$(__ndctl_get_buses) all"
 		;;
 	*)
 		return

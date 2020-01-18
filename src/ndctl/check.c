@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <ndctl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <sys/mman.h>
@@ -36,16 +37,11 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/short_types/short_types.h>
 
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
-#include <ndctl.h>
-#endif
-
 struct check_opts {
 	bool verbose;
 	bool force;
 	bool repair;
+	bool logfix;
 };
 
 struct btt_chk {
@@ -82,6 +78,7 @@ struct arena_info {
 	u32 flags;
 	int num;
 	struct btt_chk *bttc;
+	int log_index[2];
 };
 
 static sigjmp_buf sj_env;
@@ -142,7 +139,7 @@ static int btt_write_info(struct btt_chk *bttc, struct btt_sb *btt_sb, u64 off)
 		err(bttc, "BTT info block at offset %#lx needs to be restored\n",
 			off);
 		repair_msg(bttc);
-		return -1;
+		return -EIO;
 	}
 	info(bttc, "Restoring BTT info block at offset %#lx\n", off);
 
@@ -187,7 +184,7 @@ static int btt_copy_to_info2(struct arena_info *a)
 	ms_align = (void *)rounddown((u64)a->map.info2, a->bttc->sys_page_size);
 	ms_size = max(BTT_INFO_SIZE, a->bttc->sys_page_size);
 	if (msync(ms_align, ms_size, MS_SYNC) < 0)
-		return errno;
+		return -errno;
 
 	return 0;
 }
@@ -234,15 +231,26 @@ static int btt_map_write(struct arena_info *a, u32 lba, u32 mapping)
 	ms_align = (void *)rounddown((u64)&a->map.map[lba],
 		a->bttc->sys_page_size);
 	if (msync(ms_align, a->bttc->sys_page_size, MS_SYNC) < 0)
-		return errno;
+		return -errno;
 
 	return 0;
 }
 
-static void btt_log_read_pair(struct arena_info *a, u32 lane,
-			struct log_entry *ent)
+static void btt_log_group_read(struct arena_info *a, u32 lane,
+			struct log_group *log)
 {
-	memcpy(ent, &a->map.log[lane * 2], 2 * sizeof(struct log_entry));
+	memcpy(log, &a->map.log[lane], LOG_GRP_SIZE);
+}
+
+static void btt_log_group_write(struct arena_info *a, u32 lane,
+			struct log_group *log)
+{
+	memcpy(&a->map.log[lane], log, LOG_GRP_SIZE);
+}
+
+static u32 log_seq(struct log_group *log, int log_idx)
+{
+	return le32_to_cpu(log->ent[log_idx].seq);
 }
 
 /*
@@ -250,22 +258,24 @@ static void btt_log_read_pair(struct arena_info *a, u32 lane,
  * find the 'older' entry. The return value indicates which of the two was
  * the 'old' entry
  */
-static int btt_log_get_old(struct log_entry *ent)
+static int btt_log_get_old(struct arena_info *a, struct log_group *log)
 {
+	int idx0 = a->log_index[0];
+	int idx1 = a->log_index[1];
 	int old;
 
-	if (ent[0].seq == 0) {
-		ent[0].seq = cpu_to_le32(1);
+	if (log_seq(log, idx0) == 0) {
+		log->ent[idx0].seq = cpu_to_le32(1);
 		return 0;
 	}
 
-	if (le32_to_cpu(ent[0].seq) < le32_to_cpu(ent[1].seq)) {
-		if (le32_to_cpu(ent[1].seq) - le32_to_cpu(ent[0].seq) == 1)
+	if (log_seq(log, idx0) < log_seq(log, idx1)) {
+		if ((log_seq(log, idx1) - log_seq(log, idx0)) == 1)
 			old = 0;
 		else
 			old = 1;
 	} else {
-		if (le32_to_cpu(ent[0].seq) - le32_to_cpu(ent[1].seq) == 1)
+		if ((log_seq(log, idx0) - log_seq(log, idx1)) == 1)
 			old = 1;
 		else
 			old = 0;
@@ -277,13 +287,13 @@ static int btt_log_get_old(struct log_entry *ent)
 static int btt_log_read(struct arena_info *a, u32 lane, struct log_entry *ent)
 {
 	int new_ent;
-	struct log_entry log[2];
+	struct log_group log;
 
 	if (ent == NULL)
 		return -EINVAL;
-	btt_log_read_pair(a, lane, log);
-	new_ent = 1 - btt_log_get_old(log);
-	memcpy(ent, &log[new_ent], sizeof(struct log_entry));
+	btt_log_group_read(a, lane, &log);
+	new_ent = 1 - btt_log_get_old(a, &log);
+	memcpy(ent, &log.ent[a->log_index[new_ent]], LOG_ENT_SIZE);
 	return 0;
 }
 
@@ -350,6 +360,7 @@ enum btt_errcodes {
 	BTT_LOG_MAP_ERR,
 	BTT_MAP_OOB,
 	BTT_BITMAP_ERROR,
+	BTT_LOGFIX_ERR,
 };
 
 static void btt_xlat_status(struct arena_info *a, int errcode)
@@ -397,6 +408,11 @@ static void btt_xlat_status(struct arena_info *a, int errcode)
 			"arena %d: bitmap error: internal blocks are incorrectly referenced\n",
 			a->num);
 		break;
+	case BTT_LOGFIX_ERR:
+		err(a->bttc,
+			"arena %d: rewrite-log error: log may be in an unknown/unrecoverable state\n",
+			a->num);
+		break;
 	default:
 		err(a->bttc, "arena %d: unknown error: %d\n",
 			a->num, errcode);
@@ -406,6 +422,8 @@ static void btt_xlat_status(struct arena_info *a, int errcode)
 /* Check that log entries are self consistent */
 static int btt_check_log_entries(struct arena_info *a)
 {
+	int idx0 = a->log_index[0];
+	int idx1 = a->log_index[1];
 	unsigned int i;
 	int rc = 0;
 
@@ -413,28 +431,30 @@ static int btt_check_log_entries(struct arena_info *a)
 	 * First, check both 'slots' for sequence numbers being distinct
 	 * and in bounds
 	 */
-	for (i = 0; i < (2 * a->nfree); i+=2) {
-		if (a->map.log[i].seq == a->map.log[i + 1].seq)
+	for (i = 0; i < a->nfree; i++) {
+		struct log_group *log = &a->map.log[i];
+
+		if (log_seq(log, idx0) == log_seq(log, idx1))
 			return BTT_LOG_EQL_SEQ;
-		if (a->map.log[i].seq > 3 || a->map.log[i + 1].seq > 3)
+		if (log_seq(log, idx0) > 3 || log_seq(log, idx1) > 3)
 			return BTT_LOG_OOB_SEQ;
 	}
 	/*
 	 * Next, check only the 'new' slot in each lane for the remaining
-	 * entries being in bounds
+	 * fields being in bounds
 	 */
 	for (i = 0; i < a->nfree; i++) {
-		struct log_entry log;
+		struct log_entry ent;
 
-		rc = btt_log_read(a, i, &log);
+		rc = btt_log_read(a, i, &ent);
 		if (rc)
 			return rc;
 
-		if (log.lba >= a->external_nlba)
+		if (ent.lba >= a->external_nlba)
 			return BTT_LOG_OOB_LBA;
-		if (log.old_map >= a->internal_nlba)
+		if (ent.old_map >= a->internal_nlba)
 			return BTT_LOG_OOB_OLD;
-		if (log.new_map >= a->internal_nlba)
+		if (ent.new_map >= a->internal_nlba)
 			return BTT_LOG_OOB_NEW;
 	}
 	return rc;
@@ -462,23 +482,23 @@ static int btt_check_log_map(struct arena_info *a)
 	int rc = 0, rc_saved = 0;
 
 	for (i = 0; i < a->nfree; i++) {
-		struct log_entry log;
+		struct log_entry ent;
 
-		rc = btt_log_read(a, i, &log);
+		rc = btt_log_read(a, i, &ent);
 		if (rc)
 			return rc;
-		mapping = btt_map_lookup(a, log.lba);
+		mapping = btt_map_lookup(a, ent.lba);
 
 		/*
 		 * Case where the flog was written, but map couldn't be
 		 * updated. The kernel should also be able to detect and
 		 * fix this condition.
 		 */
-		if (log.new_map != mapping && log.old_map == mapping) {
+		if (ent.new_map != mapping && ent.old_map == mapping) {
 			info(a->bttc,
 				"arena %d: log[%d].new_map (%#x) doesn't match map[%#x] (%#x)\n",
-				a->num, i, log.new_map, log.lba, mapping);
-			rc = btt_map_write(a, log.lba, log.new_map);
+				a->num, i, ent.new_map, ent.lba, mapping);
+			rc = btt_map_write(a, ent.lba, ent.new_map);
 			if (rc)
 				rc_saved = rc;
 		}
@@ -508,7 +528,7 @@ static int btt_check_bitmap(struct arena_info *a)
 {
 	unsigned long *bm;
 	u32 i, btt_mapping;
-	int rc;
+	int rc = BTT_BITMAP_ERROR;
 
 	bm = bitmap_alloc(a->internal_nlba);
 	if (bm == NULL)
@@ -521,7 +541,6 @@ static int btt_check_bitmap(struct arena_info *a)
 			info(a->bttc,
 				"arena %d: internal block %#x is referenced by two map entries\n",
 				a->num, btt_mapping);
-			rc = BTT_BITMAP_ERROR;
 			goto out;
 		}
 		bitmap_set(bm, btt_mapping, 1);
@@ -529,19 +548,19 @@ static int btt_check_bitmap(struct arena_info *a)
 
 	/* map 'nfree' number of flog entries */
 	for (i = 0; i < a->nfree; i++) {
-		struct log_entry log;
+		struct log_entry ent;
 
-		rc = btt_log_read(a, i, &log);
+		rc = btt_log_read(a, i, &ent);
 		if (rc)
 			goto out;
-		if (test_bit(log.old_map, bm)) {
+		if (test_bit(ent.old_map, bm)) {
 			info(a->bttc,
 				"arena %d: internal block %#x is referenced by two map/log entries\n",
-				a->num, log.old_map);
+				a->num, ent.old_map);
 			rc = BTT_BITMAP_ERROR;
 			goto out;
 		}
-		bitmap_set(bm, log.old_map, 1);
+		bitmap_set(bm, ent.old_map, 1);
 	}
 
 	/* check that the bitmap is full */
@@ -550,6 +569,44 @@ static int btt_check_bitmap(struct arena_info *a)
  out:
 	free(bm);
 	return rc;
+}
+
+static int btt_rewrite_log(struct arena_info *a)
+{
+	struct log_group log;
+	int rc;
+	u32 i;
+
+	info(a->bttc, "arena %d: rewriting log\n", a->num);
+	/*
+	 * To rewrite the log, we implicitly use the 'new' padding scheme of
+	 * (0, 1) but resetting the log to a completely initial state (i.e.
+	 * slot-0 contains a made-up entry containing the 'free' block from
+	 * the existing current log entry, and a sequence number of '1'. All
+	 * other slots are zeroed.
+	 *
+	 * This way of rewriting the log is the most flexible as it can be
+	 * (ab)used to convert a new padding format back to the old one.
+	 * Since it only recreates slot-0, which is common between both
+	 * existing formats, an older kernel will simply initialize the free
+	 * list using those slot-0 entries, and run with it as though slot-2
+	 * is the other valid slot.
+	 */
+	memset(&log, 0, LOG_GRP_SIZE);
+	for (i = 0; i < a->nfree; i++) {
+		struct log_entry ent;
+
+		rc = btt_log_read(a, i, &ent);
+		if (rc)
+			return BTT_LOGFIX_ERR;
+
+		log.ent[0].lba = ent.lba;
+		log.ent[0].old_map = ent.old_map;
+		log.ent[0].new_map = ent.new_map;
+		log.ent[0].seq = 1;
+		btt_log_group_write(a, i, &log);
+	}
+	return 0;
 }
 
 static int btt_check_arenas(struct btt_chk *bttc)
@@ -580,11 +637,18 @@ static int btt_check_arenas(struct btt_chk *bttc)
 		rc = btt_check_bitmap(a);
 		if (rc)
 			break;
+
+		if (bttc->opts->logfix) {
+			rc = btt_rewrite_log(a);
+			if (rc)
+				break;
+		}
 	}
 
-	btt_xlat_status(a, rc);
-	if (rc)
+	if (a && rc != BTT_OK) {
+		btt_xlat_status(a, rc);
 		return -ENXIO;
+	}
 	return 0;
 }
 
@@ -629,6 +693,123 @@ static int btt_parse_meta(struct arena_info *arena, struct btt_sb *btt_sb,
 		err(arena->bttc, "Info block error flag is set, aborting\n");
 		return -ENXIO;
 	}
+	return 0;
+}
+
+static bool ent_is_padding(struct log_entry *ent)
+{
+	return (ent->lba == 0) && (ent->old_map == 0) && (ent->new_map == 0)
+		&& (ent->seq == 0);
+}
+
+/*
+ * Detecting valid log indices: We read a log group, and iterate over its
+ * four slots. We expect that a padding slot will be all-zeroes, and use this
+ * to detect a padding slot vs. an actual entry.
+ *
+ * If a log_group is in the initial state, i.e. hasn't been used since the
+ * creation of this BTT layout, it will have three of the four slots with
+ * zeroes. We skip over these log_groups for the detection of log_index. If
+ * all log_groups are in the initial state (i.e. the BTT has never been
+ * written to), it is safe to assume the 'new format' of log entries in slots
+ * (0, 1).
+ */
+static int log_set_indices(struct arena_info *arena)
+{
+	bool idx_set = false, initial_state = true;
+	int log_index[2] = {-1, -1};
+	struct log_group log;
+	int j, next_idx = 0;
+	u32 pad_count = 0;
+	u32 i;
+
+	for (i = 0; i < arena->nfree; i++) {
+		btt_log_group_read(arena, i, &log);
+
+		for (j = 0; j < 4; j++) {
+			if (!idx_set) {
+				if (ent_is_padding(&log.ent[j])) {
+					pad_count++;
+					continue;
+				} else {
+					/* Skip if index has been recorded */
+					if ((next_idx == 1) &&
+						(j == log_index[0]))
+						continue;
+					/* valid entry, record index */
+					log_index[next_idx] = j;
+					next_idx++;
+				}
+				if (next_idx == 2) {
+					/* two valid entries found */
+					idx_set = true;
+				} else if (next_idx > 2) {
+					/* too many valid indices */
+					return -ENXIO;
+				}
+			} else {
+				/*
+				 * once the indices have been set, just verify
+				 * that all subsequent log groups are either in
+				 * their initial state or follow the same
+				 * indices.
+				 */
+				if (j == log_index[0]) {
+					/* entry must be 'valid' */
+					if (ent_is_padding(&log.ent[j]))
+						return -ENXIO;
+				} else if (j == log_index[1]) {
+					;
+					/*
+					 * log_index[1] can be padding if the
+					 * lane never got used and it is still
+					 * in the initial state (three 'padding'
+					 * entries)
+					 */
+				} else {
+					/* entry must be invalid (padding) */
+					if (!ent_is_padding(&log.ent[j]))
+						return -ENXIO;
+				}
+			}
+		}
+		/*
+		 * If any of the log_groups have more than one valid,
+		 * non-padding entry, then the we are no longer in the
+		 * initial_state
+		 */
+		if (pad_count < 3)
+			initial_state = false;
+		pad_count = 0;
+	}
+
+	if (!initial_state && !idx_set)
+		return -ENXIO;
+
+	/*
+	 * If all the entries in the log were in the initial state,
+	 * assume new padding scheme
+	 */
+	if (initial_state)
+		log_index[1] = 1;
+
+	/*
+	 * Only allow the known permutations of log/padding indices,
+	 * i.e. (0, 1), and (0, 2)
+	 */
+	if ((log_index[0] == 0) && ((log_index[1] == 1) || (log_index[1] == 2)))
+		; /* known index possibilities */
+	else {
+		err(arena->bttc, "Found an unknown padding scheme\n");
+		return -ENXIO;
+	}
+
+	arena->log_index[0] = log_index[0];
+	arena->log_index[1] = log_index[1];
+	info(arena->bttc, "arena[%d]: log_index_0 = %d\n",
+		arena->num, log_index[0]);
+	info(arena->bttc, "arena[%d]: log_index_1 = %d\n",
+		arena->num, log_index[1]);
 	return 0;
 }
 
@@ -691,8 +872,8 @@ static int btt_discover_arenas(struct btt_chk *bttc)
 			}
 			ret = btt_write_info(bttc, btt_sb, cur_off);
 			if (ret) {
-				err(bttc, "Restoration of the info block failed: %d\n",
-					ret);
+				err(bttc, "Restoration of the info block failed: %s (%d)\n",
+					strerror(abs(ret)), ret);
 				goto out;
 			}
 		}
@@ -743,8 +924,8 @@ static int btt_create_mappings(struct btt_chk *bttc)
 		a->map.info = mmap(NULL, a->map.info_len, mmap_flags,
 			MAP_SHARED, bttc->fd, a->infooff);
 		if (a->map.info == MAP_FAILED) {
-			err(bttc, "mmap arena[%d].info [sz = %#lx, off = %#lx] failed: %d\n",
-				i, a->map.info_len, a->infooff, errno);
+			err(bttc, "mmap arena[%d].info [sz = %#lx, off = %#lx] failed: %s\n",
+				i, a->map.info_len, a->infooff, strerror(errno));
 			return -errno;
 		}
 
@@ -752,8 +933,8 @@ static int btt_create_mappings(struct btt_chk *bttc)
 		a->map.data = mmap(NULL, a->map.data_len, mmap_flags,
 			MAP_SHARED, bttc->fd, a->dataoff);
 		if (a->map.data == MAP_FAILED) {
-			err(bttc, "mmap arena[%d].data [sz = %#lx, off = %#lx] failed: %d\n",
-				i, a->map.data_len, a->dataoff, errno);
+			err(bttc, "mmap arena[%d].data [sz = %#lx, off = %#lx] failed: %s\n",
+				i, a->map.data_len, a->dataoff, strerror(errno));
 			return -errno;
 		}
 
@@ -761,8 +942,8 @@ static int btt_create_mappings(struct btt_chk *bttc)
 		a->map.map = mmap(NULL, a->map.map_len, mmap_flags,
 			MAP_SHARED, bttc->fd, a->mapoff);
 		if (a->map.map == MAP_FAILED) {
-			err(bttc, "mmap arena[%d].map [sz = %#lx, off = %#lx] failed: %d\n",
-				i, a->map.map_len, a->mapoff, errno);
+			err(bttc, "mmap arena[%d].map [sz = %#lx, off = %#lx] failed: %s\n",
+				i, a->map.map_len, a->mapoff, strerror(errno));
 			return -errno;
 		}
 
@@ -770,8 +951,8 @@ static int btt_create_mappings(struct btt_chk *bttc)
 		a->map.log = mmap(NULL, a->map.log_len, mmap_flags,
 			MAP_SHARED, bttc->fd, a->logoff);
 		if (a->map.log == MAP_FAILED) {
-			err(bttc, "mmap arena[%d].log [sz = %#lx, off = %#lx] failed: %d\n",
-				i, a->map.log_len, a->logoff, errno);
+			err(bttc, "mmap arena[%d].log [sz = %#lx, off = %#lx] failed: %s\n",
+				i, a->map.log_len, a->logoff, strerror(errno));
 			return -errno;
 		}
 
@@ -779,8 +960,8 @@ static int btt_create_mappings(struct btt_chk *bttc)
 		a->map.info2 = mmap(NULL, a->map.info2_len, mmap_flags,
 			MAP_SHARED, bttc->fd, a->info2off);
 		if (a->map.info2 == MAP_FAILED) {
-			err(bttc, "mmap arena[%d].info2 [sz = %#lx, off = %#lx] failed: %d\n",
-				i, a->map.info2_len, a->info2off, errno);
+			err(bttc, "mmap arena[%d].info2 [sz = %#lx, off = %#lx] failed: %s\n",
+				i, a->map.info2_len, a->info2off, strerror(errno));
 			return -errno;
 		}
 	}
@@ -965,19 +1146,21 @@ static int btt_recover_first_sb(struct btt_chk *bttc)
 }
 
 int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
-		bool repair)
+		bool repair, bool logfix)
 {
 	const char *devname = ndctl_namespace_get_devname(ndns);
 	struct check_opts __opts = {
 		.verbose = verbose,
 		.force = force,
 		.repair = repair,
+		.logfix = logfix,
 	}, *opts = &__opts;
 	int raw_mode, rc, disabled_flag = 0, open_flags;
 	struct btt_sb *btt_sb;
 	struct btt_chk *bttc;
 	struct sigaction act;
 	char path[50];
+	int i;
 
 	bttc = calloc(1, sizeof(*bttc));
 	if (bttc == NULL)
@@ -995,6 +1178,16 @@ int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
 		err(bttc, "Unable to set sigaction\n");
 		rc = -errno;
 		goto out_bttc;
+	}
+
+	if (opts->logfix) {
+		if (!opts->repair) {
+			err(bttc, "--rewrite-log also requires --repair\n");
+			rc = -EINVAL;
+			goto out_bttc;
+		}
+		info(bttc,
+			"WARNING: interruption may cause unrecoverable metadata corruption\n");
 	}
 
 	bttc->opts = opts;
@@ -1026,8 +1219,8 @@ int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
 	 */
 	rc = ndctl_namespace_set_raw_mode(ndns, 1);
 	if (rc < 0) {
-		err(bttc, "%s: failed to set the raw mode flag: %d\n",
-			devname, rc);
+		err(bttc, "%s: failed to set the raw mode flag: %s (%d)\n",
+			devname, strerror(abs(rc)), rc);
 		goto out_ns;
 	}
 	/*
@@ -1036,8 +1229,8 @@ int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
 	 */
 	rc = ndctl_namespace_enable(ndns);
 	if (rc != 0) {
-		err(bttc, "%s: failed to enable in raw mode: %d\n",
-			devname, rc);
+		err(bttc, "%s: failed to enable in raw mode: %s (%d)\n",
+			devname, strerror(abs(rc)), rc);
 		goto out_ns;
 	}
 
@@ -1107,6 +1300,15 @@ int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
 	rc = btt_create_mappings(bttc);
 	if (rc)
 		goto out_close;
+
+	for (i = 0; i < bttc->num_arenas; i++) {
+		rc = log_set_indices(&bttc->arena[i]);
+		if (rc) {
+			err(bttc,
+				"Unable to deduce log/padding indices\n");
+			goto out_close;
+		}
+	}
 
 	rc = btt_check_arenas(bttc);
 

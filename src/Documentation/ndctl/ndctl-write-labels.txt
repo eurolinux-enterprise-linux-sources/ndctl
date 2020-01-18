@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 ndctl-write-labels(1)
 =====================
 
@@ -25,5 +27,4 @@ include::labels-options.txt[]
 
 SEE ALSO
 --------
-http://pmem.io/documents/NVDIMM_Namespace_Spec.pdf[NVDIMM Namespace
-Specification]
+http://www.uefi.org/sites/default/files/resources/UEFI_Spec_2_7.pdf[UEFI NVDIMM Label Protocol]

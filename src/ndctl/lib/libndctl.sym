@@ -294,3 +294,87 @@ global:
 	ndctl_namespace_set_enforce_mode;
 	ndctl_namespace_get_enforce_mode;
 } LIBNDCTL_3;
+
+LIBNDCTL_14 {
+global:
+	ndctl_dimm_locked;
+	ndctl_dimm_aliased;
+	ndctl_cmd_smart_get_shutdown_count;
+	ndctl_bus_wait_for_scrub_completion;
+	ndctl_bus_get_scrub_count;
+	ndctl_bus_has_error_injection;
+	ndctl_namespace_inject_error;
+	ndctl_namespace_uninject_error;
+	ndctl_namespace_injection_status;
+	ndctl_namespace_injection_get_first_bb;
+	ndctl_namespace_injection_get_next_bb;
+	ndctl_bb_get_block;
+	ndctl_bb_get_count;
+	ndctl_cmd_smart_get_media_temperature;
+	ndctl_cmd_smart_threshold_get_media_temperature;
+	ndctl_cmd_smart_get_ctrl_temperature;
+	ndctl_cmd_smart_threshold_get_ctrl_temperature;
+	ndctl_dimm_cmd_new_smart_set_threshold;
+	ndctl_cmd_smart_threshold_get_supported_alarms;
+	ndctl_cmd_smart_threshold_set_alarm_control;
+	ndctl_cmd_smart_threshold_set_temperature;
+	ndctl_cmd_smart_threshold_set_media_temperature;
+	ndctl_cmd_smart_threshold_set_ctrl_temperature;
+	ndctl_cmd_smart_threshold_set_spares;
+	ndctl_decode_smart_temperature;
+	ndctl_encode_smart_temperature;
+	ndctl_dimm_cmd_new_smart_inject;
+	ndctl_cmd_smart_inject_media_temperature;
+	ndctl_cmd_smart_inject_spares;
+	ndctl_cmd_smart_inject_fatal;
+	ndctl_cmd_smart_inject_unsafe_shutdown;
+	ndctl_dimm_cmd_new_fw_get_info;
+	ndctl_dimm_cmd_new_fw_start_update;
+	ndctl_dimm_cmd_new_fw_send;
+	ndctl_dimm_cmd_new_fw_finish;
+	ndctl_dimm_cmd_new_fw_abort;
+	ndctl_dimm_cmd_new_fw_finish_query;
+	ndctl_cmd_fw_info_get_storage_size;
+	ndctl_cmd_fw_info_get_max_send_len;
+	ndctl_cmd_fw_info_get_query_interval;
+	ndctl_cmd_fw_info_get_max_query_time;
+	ndctl_cmd_fw_info_get_run_version;
+	ndctl_cmd_fw_info_get_updated_version;
+	ndctl_cmd_fw_start_get_context;
+	ndctl_cmd_fw_fquery_get_fw_rev;
+	ndctl_cmd_fw_xlat_firmware_status;
+} LIBNDCTL_13;
+
+LIBNDCTL_15 {
+global:
+	ndctl_dimm_cmd_new_ack_shutdown_count;
+	ndctl_region_get_numa_node;
+	ndctl_dimm_fw_update_supported;
+	ndctl_region_get_persistence_domain;
+	ndctl_bus_get_persistence_domain;
+	ndctl_namespace_write_cache_is_enabled;
+	ndctl_namespace_enable_write_cache;
+	ndctl_namespace_disable_write_cache;
+	ndctl_bus_get_scrub_state;
+	ndctl_bus_start_scrub;
+	ndctl_region_deep_flush;
+} LIBNDCTL_14;
+
+LIBNDCTL_16 {
+global:
+	ndctl_cmd_ars_cap_get_clear_unit;
+	ndctl_namespace_inject_error2;
+	ndctl_namespace_uninject_error2;
+	ndctl_cmd_ars_stat_get_flag_overflow;
+} LIBNDCTL_15;
+
+LIBNDCTL_17 {
+global:
+	ndctl_dimm_smart_inject_supported;
+	ndctl_dimm_get_health;
+	ndctl_dimm_get_flags;
+	ndctl_dimm_get_event_flags;
+	ndctl_dimm_is_flag_supported;
+	ndctl_region_get_max_available_extent;
+	ndctl_cmd_smart_inject_ctrl_temperature;
+} LIBNDCTL_16;

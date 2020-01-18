@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <limits.h>
 #include <syslog.h>
+
+#include <ndctl.h>
+#include "action.h"
 #include <sys/stat.h>
 #include <uuid/uuid.h>
 #include <sys/types.h>
@@ -27,17 +30,11 @@
 #include <ndctl/libndctl.h>
 #include <util/parse-options.h>
 #include <ccan/minmax/minmax.h>
-#include <ccan/array_size/array_size.h>
-
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
-#include <ndctl.h>
-#endif
 
 static bool verbose;
 static bool force;
 static bool repair;
+static bool logfix;
 static struct parameters {
 	bool do_scan;
 	bool mode_default;
@@ -106,7 +103,7 @@ OPT_STRING('n', "name", &param.name, "name", \
 OPT_STRING('s', "size", &param.size, "size", \
 	"specify the namespace size in bytes (default: available capacity)"), \
 OPT_STRING('m', "mode", &param.mode, "operation-mode", \
-	"specify a mode for the namespace, 'sector', 'memory', or 'raw'"), \
+	"specify a mode for the namespace, 'sector', 'fsdax', 'devdax' or 'raw'"), \
 OPT_STRING('M', "map", &param.map, "memmap-location", \
 	"specify 'mem' or 'dev' for the location of the memmap"), \
 OPT_STRING('l', "sector-size", &param.sector_size, "lba-size", \
@@ -120,6 +117,7 @@ OPT_BOOLEAN('L', "autolabel", &param.autolabel, "automatically initialize labels
 
 #define CHECK_OPTIONS() \
 OPT_BOOLEAN('R', "repair", &repair, "perform metadata repairs"), \
+OPT_BOOLEAN('L', "rewrite-log", &logfix, "regenerate the log"), \
 OPT_BOOLEAN('f', "force", &force, "check namespace even if currently active")
 
 static const struct option base_options[] = {
@@ -146,15 +144,7 @@ static const struct option check_options[] = {
 	OPT_END(),
 };
 
-enum namespace_action {
-	ACTION_ENABLE,
-	ACTION_DISABLE,
-	ACTION_CREATE,
-	ACTION_DESTROY,
-	ACTION_CHECK,
-};
-
-static int set_defaults(enum namespace_action mode)
+static int set_defaults(enum device_action mode)
 {
 	int rc = 0;
 
@@ -178,10 +168,14 @@ static int set_defaults(enum namespace_action mode)
 		      param.mode = "safe"; /* pass */
 		else if (strcmp(param.mode, "memory") == 0)
 		      /* pass */;
+		else if (strcmp(param.mode, "fsdax") == 0)
+			param.mode = "memory"; /* pass */
 		else if (strcmp(param.mode, "raw") == 0)
 		      /* pass */;
 		else if (strcmp(param.mode, "dax") == 0)
 		      /* pass */;
+		else if (strcmp(param.mode, "devdax") == 0)
+			param.mode = "dax"; /* pass */
 		else {
 			error("invalid mode '%s'\n", param.mode);
 			rc = -EINVAL;
@@ -205,8 +199,9 @@ static int set_defaults(enum namespace_action mode)
 		}
 
 		if (!param.reconfig && param.mode
-				&& strcmp(param.mode, "memory") != 0) {
-			error("--map only valid for a memory mode pmem namespace\n");
+				&& strcmp(param.mode, "memory") != 0
+				&& strcmp(param.mode, "dax") != 0) {
+			error("--map only valid for an dax mode pmem namespace\n");
 			rc = -EINVAL;
 		}
 	} else if (!param.reconfig)
@@ -214,8 +209,9 @@ static int set_defaults(enum namespace_action mode)
 
 	/* check for incompatible mode and type combinations */
 	if (param.type && param.mode && strcmp(param.type, "blk") == 0
-			&& strcmp(param.mode, "memory") == 0) {
-		error("only 'pmem' namespaces can be placed into 'memory' mode\n");
+			&& (strcmp(param.mode, "memory") == 0
+				|| strcmp(param.mode, "dax") == 0)) {
+		error("only 'pmem' namespaces support dax operation\n");
 		rc = -ENXIO;
 	}
 
@@ -248,12 +244,10 @@ static int set_defaults(enum namespace_action mode)
 			error("invalid sector size: %s\n", param.sector_size);
 			rc = -EINVAL;
 		}
-	} else if (!param.reconfig
-			&& ((param.type && strcmp(param.type, "blk") == 0)
-				|| (param.mode
-					&& strcmp(param.mode, "safe") == 0))) {
-			/* default sector size for blk-type or safe-mode */
-			param.sector_size = "4096";
+	} else if (((param.type && strcmp(param.type, "blk") == 0)
+			|| (param.mode && strcmp(param.mode, "safe") == 0))) {
+		/* default sector size for blk-type or safe-mode */
+		param.sector_size = "4096";
 	}
 
 	return rc;
@@ -264,7 +258,7 @@ static int set_defaults(enum namespace_action mode)
  * looking at actual namespace devices and available resources.
  */
 static const char *parse_namespace_options(int argc, const char **argv,
-		enum namespace_action mode, const struct option *options,
+		enum device_action mode, const struct option *options,
 		char *xable_usage)
 {
 	const char * const u[] = {
@@ -318,8 +312,9 @@ static const char *parse_namespace_options(int argc, const char **argv,
 do { \
 	int __rc = prefix##_##op(dev, p); \
 	if (__rc) { \
-		debug("%s: " #op " failed: %d\n", \
-				prefix##_get_devname(dev), __rc); \
+		debug("%s: " #op " failed: %s\n", \
+				prefix##_get_devname(dev), \
+				strerror(abs(__rc))); \
 		return __rc; \
 	} \
 } while (0)
@@ -428,7 +423,7 @@ static int setup_namespace(struct ndctl_region *region,
 		error("%s: failed to enable\n",
 				ndctl_namespace_get_devname(ndns));
 	} else {
-		unsigned long flags = UTIL_JSON_DAX | UTIL_JSON_DAX_DEVS;
+		unsigned long flags = UTIL_JSON_DAX | UTIL_JSON_DAX_DEVS | UTIL_JSON_VERBOSE;
 		struct json_object *jndns;
 
 		if (isatty(1))
@@ -468,7 +463,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 		struct ndctl_namespace *ndns, struct parsed_parameters *p)
 {
 	const char *region_name = ndctl_region_get_devname(region);
-	unsigned long long size_align = SZ_4K, units = 1;
+	unsigned long long size_align = SZ_4K, units = 1, resource;
 	unsigned int ways;
 	int rc = 0;
 
@@ -519,7 +514,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 					|| p->mode == NDCTL_NS_MODE_DAX)) {
 			debug("blk %s does not support %s mode\n", region_name,
 					p->mode == NDCTL_NS_MODE_MEMORY
-					? "memory" : "dax");
+					? "fsdax" : "devdax");
 			return -EAGAIN;
 		}
 	} else if (ndns)
@@ -538,7 +533,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 			 * supported a 2M default alignment when
 			 * ndctl_pfn_has_align() returns false.
 			 */
-			debug("%s not support 'align' for memory mode\n",
+			debug("%s not support 'align' for fsdax mode\n",
 					region_name);
 			return -EAGAIN;
 		} else if (p->mode == NDCTL_NS_MODE_DAX
@@ -547,7 +542,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 			 * Unlike the pfn case, we require the kernel to
 			 * have 'align' support for device-dax.
 			 */
-			debug("%s not support 'align' for dax mode\n",
+			debug("%s not support 'align' for devdax mode\n",
 					region_name);
 			return -EAGAIN;
 		} else if (!param.align_default
@@ -561,6 +556,20 @@ static int validate_namespace_options(struct ndctl_region *region,
 					p->mode == NDCTL_NS_MODE_SAFE
 					? "sector" : "raw");
 			return -ENXIO;
+		}
+
+		/*
+		 * Fallback to a 4K default alignment if the region is
+		 * not 2MB (typical default) aligned. This mainly helps
+		 * the nfit_test use case where it is backed by vmalloc
+		 * memory.
+		 */
+		resource = ndctl_region_get_resource(region);
+		if (param.align_default && resource < ULLONG_MAX
+				&& (resource & (SZ_2M - 1))) {
+			debug("%s: falling back to a 4K alignment\n",
+					region_name);
+			p->align = SZ_4K;
 		}
 
 		switch (p->align) {
@@ -687,7 +696,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 
 		if (ndns && p->mode != NDCTL_NS_MODE_MEMORY
 			&& p->mode != NDCTL_NS_MODE_DAX) {
-			debug("%s: --map= only valid for memory mode namespace\n",
+			debug("%s: --map= only valid for fsdax mode namespace\n",
 				ndctl_namespace_get_devname(ndns));
 			return -EINVAL;
 		}
@@ -700,10 +709,10 @@ static int validate_namespace_options(struct ndctl_region *region,
 		struct ndctl_pfn *pfn = ndctl_region_get_pfn_seed(region);
 
 		if (!pfn && param.mode_default) {
-			debug("%s memory mode not available\n", region_name);
+			debug("%s fsdax mode not available\n", region_name);
 			p->mode = NDCTL_NS_MODE_RAW;
 		} else if (!pfn) {
-			error("operation failed, %s memory mode not available\n",
+			error("operation failed, %s fsdax mode not available\n",
 					region_name);
 			return -EINVAL;
 		}
@@ -714,7 +723,7 @@ static int validate_namespace_options(struct ndctl_region *region,
 		struct ndctl_dax *dax = ndctl_region_get_dax_seed(region);
 
 		if (!dax) {
-			error("operation failed, %s dax mode not available\n",
+			error("operation failed, %s devdax mode not available\n",
 					region_name);
 			return -EINVAL;
 		}
@@ -750,12 +759,14 @@ static int namespace_create(struct ndctl_region *region)
 		return rc;
 
 	if (ndctl_region_get_ro(region)) {
-		debug("%s: read-only, inelligible for namespace creation\n",
+		debug("%s: read-only, ineligible for namespace creation\n",
 			devname);
 		return -EAGAIN;
 	}
 
-	available = ndctl_region_get_available_size(region);
+	available = ndctl_region_get_max_available_extent(region);
+	if (available == ULLONG_MAX)
+		available = ndctl_region_get_available_size(region);
 	if (!available || p.size > available) {
 		debug("%s: insufficient capacity size: %llx avail: %llx\n",
 			devname, p.size, available);
@@ -888,8 +899,10 @@ static int enable_labels(struct ndctl_region *region)
 	count = 0;
 	ndctl_dimm_foreach_in_region(region, dimm)
 		if (ndctl_dimm_is_active(dimm)) {
+			warning("%s is active in %s, failing autolabel\n",
+					ndctl_dimm_get_devname(dimm),
+					ndctl_region_get_devname(region));
 			count++;
-			break;
 		}
 
 	/* some of the dimms belong to multiple regions?? */
@@ -932,7 +945,7 @@ out:
 	if (ndctl_region_get_nstype(region) != ND_DEVICE_NAMESPACE_PMEM) {
 		debug("%s: failed to initialize labels\n",
 				ndctl_region_get_devname(region));
-		return -ENXIO;
+		return -EBUSY;
 	}
 
 	return 0;
@@ -955,9 +968,8 @@ static int namespace_reconfig(struct ndctl_region *region,
 	/* check if we can enable labels on this region */
 	if (ndctl_region_get_nstype(region) == ND_DEVICE_NAMESPACE_IO
 			&& p.autolabel) {
-		rc = enable_labels(region);
-		if (rc)
-			return rc;
+		/* if this fails, try to continue label-less */
+		enable_labels(region);
 	}
 
 	ndns = region_get_namespace(region);
@@ -972,10 +984,10 @@ static int namespace_reconfig(struct ndctl_region *region,
 }
 
 int namespace_check(struct ndctl_namespace *ndns, bool verbose, bool force,
-		bool repair);
+		bool repair, bool logfix);
 
 static int do_xaction_namespace(const char *namespace,
-		enum namespace_action action, struct ndctl_ctx *ctx)
+		enum device_action action, struct ndctl_ctx *ctx)
 {
 	struct ndctl_namespace *ndns, *_n;
 	int rc = -ENXIO, success = 0;
@@ -1036,7 +1048,7 @@ static int do_xaction_namespace(const char *namespace,
 					break;
 				case ACTION_CHECK:
 					rc = namespace_check(ndns, verbose,
-							force, repair);
+							force, repair, logfix);
 					if (rc < 0)
 						return rc;
 					break;
@@ -1045,6 +1057,9 @@ static int do_xaction_namespace(const char *namespace,
 					if (rc < 0)
 						return rc;
 					return 1;
+				default:
+					rc = -EINVAL;
+					break;
 				}
 				if (rc >= 0)
 					success++;

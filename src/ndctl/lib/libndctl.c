@@ -10,7 +10,9 @@
  * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
  * more details.
  */
+#include <poll.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdarg.h>
@@ -28,12 +30,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/build_assert/build_assert.h>
 
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
 #include <ndctl.h>
-#endif
-
 #include <util/sysfs.h>
 #include <ndctl/libndctl.h>
 #include <ndctl/namespace.h>
@@ -77,6 +74,35 @@ NDCTL_EXPORT size_t ndctl_sizeof_namespace_label(void)
 	return offsetof(struct namespace_label, type_guid);
 }
 
+NDCTL_EXPORT double ndctl_decode_smart_temperature(unsigned int temp)
+{
+	bool negative = !!(temp & (1 << 15));
+	double t;
+
+	temp &= ~(1 << 15);
+	t = temp;
+	t /= 16;
+	if (negative)
+		t *= -1;
+	return t;
+}
+
+NDCTL_EXPORT unsigned int ndctl_encode_smart_temperature(double temp)
+{
+	bool negative = false;
+	unsigned int t;
+
+	if  (temp < 0) {
+		negative = true;
+		temp *= -1;
+	}
+	t = temp;
+	t *= 16;
+	if (negative)
+		t |= (1 << 15);
+	return t;
+}
+
 struct ndctl_ctx;
 
 /**
@@ -106,6 +132,7 @@ struct ndctl_mapping {
  * @type_name: 'pmem' or 'block'
  * @generation: incremented everytime the region is disabled
  * @nstype: the resulting type of namespace this region produces
+ * @numa_node: numa node attribute
  *
  * A region may alias between pmem and block-window access methods.  The
  * region driver is tasked with parsing the label (if their is one) and
@@ -131,6 +158,7 @@ struct ndctl_region {
 	char *region_buf;
 	int buf_len;
 	int generation;
+	int numa_node;
 	struct list_head btts;
 	struct list_head pfns;
 	struct list_head daxs;
@@ -152,48 +180,9 @@ struct ndctl_region {
 	} iset;
 	FILE *badblocks;
 	struct badblock bb;
-};
-
-/**
- * struct ndctl_lbasize - lbasize info for btt and blk-namespace devices
- * @select: currently selected sector_size
- * @supported: possible sector_size options
- * @num: number of entries in @supported
- */
-struct ndctl_lbasize {
-	int select;
-	unsigned int *supported;
-	int num;
-};
-
-/**
- * struct ndctl_namespace - device claimed by the nd_blk or nd_pmem driver
- * @module: kernel module
- * @type: integer nd-bus device-type
- * @type_name: 'namespace_io', 'namespace_pmem', or 'namespace_block'
- * @namespace_path: devpath for namespace device
- * @bdev: associated block_device of a namespace
- * @size: unsigned
- * @numa_node: numa node attribute
- *
- * A 'namespace' is the resulting device after region-aliasing and
- * label-parsing is resolved.
- */
-struct ndctl_namespace {
-	struct kmod_module *module;
-	struct ndctl_region *region;
-	struct list_node list;
-	char *ndns_path;
-	char *ndns_buf;
-	char *bdev;
-	int type, id, buf_len, raw_mode;
-	int generation;
-	unsigned long long resource, size;
-	enum ndctl_namespace_mode enforce_mode;
-	char *alt_name;
-	uuid_t uuid;
-	struct ndctl_lbasize lbasize;
-	int numa_node;
+	enum ndctl_persistence_domain persistence_domain;
+	/* file descriptor for deep flush sysfs entry */
+	int flush_fd;
 };
 
 /**
@@ -389,8 +378,12 @@ NDCTL_EXPORT struct ndctl_ctx *ndctl_ref(struct ndctl_ctx *ctx)
 
 static void free_namespace(struct ndctl_namespace *ndns, struct list_head *head)
 {
+	struct ndctl_bb *bb, *next;
+
 	if (head)
 		list_del_from(head, &ndns->list);
+	list_for_each_safe(&ndns->injected_bb, bb, next, list)
+		free(bb);
 	free(ndns->lbasize.supported);
 	free(ndns->ndns_path);
 	free(ndns->ndns_buf);
@@ -520,6 +513,8 @@ static void free_region(struct ndctl_region *region)
 	free(region->region_path);
 	if (region->badblocks)
 		fclose(region->badblocks);
+	if (region->flush_fd > 0)
+		close(region->flush_fd);
 	free(region);
 }
 
@@ -555,6 +550,7 @@ static void free_bus(struct ndctl_bus *bus, struct list_head *head)
 	free(bus->bus_path);
 	free(bus->bus_buf);
 	free(bus->wait_probe_path);
+	free(bus->scrub_path);
 	free(bus);
 }
 
@@ -657,7 +653,7 @@ static int device_parse(struct ndctl_ctx *ctx, struct ndctl_bus *bus,
 	return sysfs_device_parse(ctx, base_path, dev_name, parent, add_dev);
 }
 
-static int to_dsm_index(const char *name, int dimm)
+static int to_cmd_index(const char *name, int dimm)
 {
 	const char *(*cmd_name_fn)(unsigned cmd);
 	int i, end_cmd;
@@ -666,9 +662,7 @@ static int to_dsm_index(const char *name, int dimm)
 		end_cmd = ND_CMD_CALL;
 		cmd_name_fn = nvdimm_cmd_name;
 	} else {
-		end_cmd = nd_cmd_clear_error;
-		if (!end_cmd)
-			end_cmd = nd_cmd_ars_status;
+		end_cmd = ND_CMD_CLEAR_ERROR;
 		cmd_name_fn = nvdimm_bus_cmd_name;
 	}
 
@@ -685,7 +679,7 @@ static int to_dsm_index(const char *name, int dimm)
 
 static unsigned long parse_commands(char *commands, int dimm)
 {
-	unsigned long dsm_mask = 0;
+	unsigned long cmd_mask = 0;
 	char *start, *end;
 
 	start = commands;
@@ -693,12 +687,12 @@ static unsigned long parse_commands(char *commands, int dimm)
 		int cmd;
 
 		*end = '\0';
-		cmd = to_dsm_index(start, dimm);
+		cmd = to_cmd_index(start, dimm);
 		if (cmd)
-			dsm_mask |= 1 << cmd;
+			cmd_mask |= 1 << cmd;
 		start = end + 1;
 	}
-	return dsm_mask;
+	return cmd_mask;
 }
 
 static void parse_nfit_mem_flags(struct ndctl_dimm *dimm, char *flags)
@@ -722,6 +716,26 @@ static void parse_nfit_mem_flags(struct ndctl_dimm *dimm, char *flags)
 			dimm->flags.f_map = 1;
 		else if (strcmp(start, "smart_notify") == 0)
 			dimm->flags.f_notify = 1;
+		start = end + 1;
+	}
+	if (end != start)
+		dbg(ndctl_dimm_get_ctx(dimm), "%s: %s\n",
+				ndctl_dimm_get_devname(dimm), flags);
+}
+
+static void parse_dimm_flags(struct ndctl_dimm *dimm, char *flags)
+{
+	char *start, *end;
+
+	dimm->locked = 0;
+	dimm->aliased = 0;
+	start = flags;
+	while ((end = strchr(start, ' '))) {
+		*end = '\0';
+		if (strcmp(start, "lock") == 0)
+			dimm->locked = 1;
+		else if (strcmp(start, "alias") == 0)
+			dimm->aliased = 1;
 		start = end + 1;
 	}
 	if (end != start)
@@ -755,7 +769,7 @@ static void *add_bus(void *parent, int id, const char *ctl_base)
 	sprintf(path, "%s/device/commands", ctl_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
-	bus->dsm_mask = parse_commands(buf, 0);
+	bus->cmd_mask = parse_commands(buf, 0);
 
 	sprintf(path, "%s/device/nfit/revision", ctl_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0) {
@@ -785,6 +799,11 @@ static void *add_bus(void *parent, int id, const char *ctl_base)
 	if (!bus->wait_probe_path)
 		goto err_read;
 
+	sprintf(path, "%s/device/nfit/scrub", ctl_base);
+	bus->scrub_path = strdup(path);
+	if (!bus->scrub_path)
+		goto err_read;
+
 	bus->bus_path = parent_dev_path("char", bus->major, bus->minor);
 	if (!bus->bus_path)
 		goto err_dev_path;
@@ -809,6 +828,8 @@ static void *add_bus(void *parent, int id, const char *ctl_base)
 
  err_dev_path:
  err_read:
+	free(bus->wait_probe_path);
+	free(bus->scrub_path);
 	free(bus->provider);
 	free(bus->bus_buf);
 	free(bus);
@@ -898,6 +919,22 @@ NDCTL_EXPORT struct ndctl_bus *ndctl_bus_get_by_provider(struct ndctl_ctx *ctx,
 			return bus;
 
 	return NULL;
+}
+
+NDCTL_EXPORT enum ndctl_persistence_domain
+ndctl_bus_get_persistence_domain(struct ndctl_bus *bus)
+{
+	struct ndctl_region *region;
+	enum ndctl_persistence_domain pd = -1;
+
+	/* iterate through region to get the region persistence domain */
+	ndctl_region_foreach(bus, region) {
+		/* we are looking for the least persistence domain */
+		if (pd < region->persistence_domain)
+			pd = region->persistence_domain;
+	}
+
+	return pd < 0 ? PERSISTENCE_UNKNOWN : pd;
 }
 
 NDCTL_EXPORT struct ndctl_btt *ndctl_region_get_btt_seed(struct ndctl_region *region)
@@ -1016,6 +1053,14 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_resource(struct ndctl_region *r
 	return strtoull(buf, NULL, 0);
 }
 
+NDCTL_EXPORT int ndctl_region_deep_flush(struct ndctl_region *region)
+{
+	int rc = pwrite(region->flush_fd, "1\n", 1, 0);
+
+	return (rc == -1) ? -errno : 0;
+}
+
+
 NDCTL_EXPORT const char *ndctl_bus_get_cmd_name(struct ndctl_bus *bus, int cmd)
 {
 	return nvdimm_bus_cmd_name(cmd);
@@ -1024,7 +1069,7 @@ NDCTL_EXPORT const char *ndctl_bus_get_cmd_name(struct ndctl_bus *bus, int cmd)
 NDCTL_EXPORT int ndctl_bus_is_cmd_supported(struct ndctl_bus *bus,
 		int cmd)
 {
-	return !!(bus->dsm_mask & (1ULL << cmd));
+	return !!(bus->cmd_mask & (1ULL << cmd));
 }
 
 NDCTL_EXPORT unsigned int ndctl_bus_get_revision(struct ndctl_bus *bus)
@@ -1081,6 +1126,141 @@ NDCTL_EXPORT int ndctl_bus_wait_probe(struct ndctl_bus *bus)
 	return rc < 0 ? -ENXIO : 0;
 }
 
+static int __ndctl_bus_get_scrub_state(struct ndctl_bus *bus,
+		unsigned int *scrub_count, bool *active)
+{
+	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
+	char buf[SYSFS_ATTR_SIZE];
+	char in_progress = '\0';
+	int rc;
+
+	rc = sysfs_read_attr(ctx, bus->scrub_path, buf);
+	if (rc < 0)
+		return -EOPNOTSUPP;
+
+	rc = sscanf(buf, "%u%c", scrub_count, &in_progress);
+	if (rc < 0)
+		return -ENXIO;
+
+	switch (rc) {
+	case 1:
+		*active = false;
+		return 0;
+	case 2:
+		if (in_progress == '+') {
+			*active = true;
+			return 0;
+		}
+		/* fall through */
+	default:
+		/* unable to read scrub count */
+		return -ENXIO;
+	}
+}
+
+NDCTL_EXPORT int ndctl_bus_start_scrub(struct ndctl_bus *bus)
+{
+	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
+	int rc;
+
+	rc = sysfs_write_attr(ctx, bus->scrub_path, "1\n");
+	if (rc == -EBUSY)
+		return rc;
+	else if (rc < 0)
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+NDCTL_EXPORT int ndctl_bus_get_scrub_state(struct ndctl_bus *bus)
+{
+	unsigned int scrub_count = 0;
+	bool active = false;
+	int rc;
+
+	rc = __ndctl_bus_get_scrub_state(bus, &scrub_count, &active);
+	if (rc < 0)
+		return rc;
+	return active;
+}
+
+NDCTL_EXPORT unsigned int ndctl_bus_get_scrub_count(struct ndctl_bus *bus)
+{
+	unsigned int scrub_count = 0;
+	bool active = false;
+
+	if (__ndctl_bus_get_scrub_state(bus, &scrub_count, &active))
+		return UINT_MAX;
+	return scrub_count;
+}
+
+/**
+ * ndctl_bus_wait_for_scrub - wait for a scrub to complete
+ * @bus: bus for which to check whether a scrub is in progress
+ *
+ * Upon return this bus has completed any in-progress scrubs. This is
+ * different from ndctl_cmd_ars_in_progress in that the latter checks
+ * the output of an ars_status command to see if the in-progress flag
+ * is set, i.e. provides the firmware's view of whether a scrub is in
+ * progress. ndctl_bus_wait_for_scrub instead checks the kernel's view
+ * of whether a scrub is in progress by looking at the 'scrub' file in
+ * sysfs.
+ */
+NDCTL_EXPORT int ndctl_bus_wait_for_scrub_completion(struct ndctl_bus *bus)
+{
+	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
+	unsigned int scrub_count;
+	char buf[SYSFS_ATTR_SIZE];
+	struct pollfd fds;
+	char in_progress;
+	int fd = 0, rc;
+
+	fd = open(bus->scrub_path, O_RDONLY|O_CLOEXEC);
+	memset(&fds, 0, sizeof(fds));
+	fds.fd = fd;
+	for (;;) {
+		rc = sysfs_read_attr(ctx, bus->scrub_path, buf);
+		if (rc < 0) {
+			rc = -EOPNOTSUPP;
+			break;
+		}
+
+		rc = sscanf(buf, "%u%c", &scrub_count, &in_progress);
+		if (rc < 0) {
+			rc = -EOPNOTSUPP;
+			break;
+		}
+
+		if (rc == 1) {
+			/* scrub complete, break successfully */
+			rc = 0;
+			break;
+		} else if (rc == 2 && in_progress == '+') {
+			/* scrub in progress, wait */
+			rc = poll(&fds, 1, -1);
+			if (rc < 0) {
+				rc = -errno;
+				dbg(ctx, "poll error: %s\n", strerror(errno));
+				break;
+			}
+			dbg(ctx, "poll wake: revents: %d\n", fds.revents);
+			if (pread(fd, buf, 1, 0) == -1) {
+				rc = -errno;
+				break;
+			}
+			fds.revents = 0;
+		}
+	}
+
+	if (rc == 0)
+		dbg(ctx, "bus%d: scrub complete\n", ndctl_bus_get_id(bus));
+	else
+		dbg(ctx, "bus%d: error waiting for scrub completion: %s\n",
+			ndctl_bus_get_id(bus), strerror(-rc));
+	if (fd)
+		close (fd);
+	return rc;
+}
+
 static int ndctl_bind(struct ndctl_ctx *ctx, struct kmod_module *module,
 		const char *devname);
 static int ndctl_unbind(struct ndctl_ctx *ctx, const char *devpath);
@@ -1119,7 +1299,7 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 	sprintf(path, "%s/commands", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
 		goto err_read;
-	dimm->dsm_mask = parse_commands(buf, 1);
+	dimm->cmd_mask = parse_commands(buf, 1);
 
 	dimm->dimm_buf = calloc(1, strlen(dimm_base) + 50);
 	if (!dimm->dimm_buf)
@@ -1135,7 +1315,6 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 		goto err_read;
 	dimm->module = to_module(ctx, buf);
 
-	dimm->smart_ops = intel_smart_ops;
 	dimm->handle = -1;
 	dimm->phys_id = -1;
 	dimm->serial = -1;
@@ -1148,9 +1327,17 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 	dimm->subsystem_revision_id = -1;
 	dimm->manufacturing_date = -1;
 	dimm->manufacturing_location = -1;
-	dimm->dsm_family = -1;
+	dimm->cmd_family = -1;
+	dimm->nfit_dsm_mask = ULONG_MAX;
 	for (i = 0; i < formats; i++)
 		dimm->format[i] = -1;
+
+	sprintf(path, "%s/flags", dimm_base);
+	if (sysfs_read_attr(ctx, path, buf) < 0) {
+		dimm->locked = -1;
+		dimm->aliased = -1;
+	} else
+		parse_dimm_flags(dimm, buf);
 
 	if (!ndctl_bus_has_nfit(bus))
 		goto out;
@@ -1214,11 +1401,17 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 
 	sprintf(path, "%s/nfit/family", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
-		dimm->dsm_family = strtoul(buf, NULL, 0);
-	if (dimm->dsm_family == NVDIMM_FAMILY_HPE1)
-		dimm->smart_ops = hpe1_smart_ops;
-	if (dimm->dsm_family == NVDIMM_FAMILY_MSFT)
-		dimm->smart_ops = msft_smart_ops;
+		dimm->cmd_family = strtoul(buf, NULL, 0);
+	if (dimm->cmd_family == NVDIMM_FAMILY_INTEL)
+		dimm->ops = intel_dimm_ops;
+	if (dimm->cmd_family == NVDIMM_FAMILY_HPE1)
+		dimm->ops = hpe1_dimm_ops;
+	if (dimm->cmd_family == NVDIMM_FAMILY_MSFT)
+		dimm->ops = msft_dimm_ops;
+
+	sprintf(path, "%s/nfit/dsm_mask", dimm_base);
+	if (sysfs_read_attr(ctx, path, buf) == 0)
+		dimm->nfit_dsm_mask = strtoul(buf, NULL, 0);
 
 	dimm->formats = formats;
 	sprintf(path, "%s/nfit/format", dimm_base);
@@ -1386,6 +1579,16 @@ NDCTL_EXPORT int ndctl_dimm_has_errors(struct ndctl_dimm *dimm)
 	return flags.flags != 0;
 }
 
+NDCTL_EXPORT int ndctl_dimm_locked(struct ndctl_dimm *dimm)
+{
+	return dimm->locked;
+}
+
+NDCTL_EXPORT int ndctl_dimm_aliased(struct ndctl_dimm *dimm)
+{
+	return dimm->aliased;
+}
+
 NDCTL_EXPORT int ndctl_dimm_has_notifications(struct ndctl_dimm *dimm)
 {
 	return dimm->flags.f_notify;
@@ -1424,12 +1627,97 @@ NDCTL_EXPORT int ndctl_dimm_failed_map(struct ndctl_dimm *dimm)
 NDCTL_EXPORT int ndctl_dimm_is_cmd_supported(struct ndctl_dimm *dimm,
 		int cmd)
 {
-	return !!(dimm->dsm_mask & (1ULL << cmd));
+	return !!(dimm->cmd_mask & (1ULL << cmd));
 }
 
 NDCTL_EXPORT int ndctl_dimm_get_health_eventfd(struct ndctl_dimm *dimm)
 {
 	return dimm->health_eventfd;
+}
+
+NDCTL_EXPORT unsigned int ndctl_dimm_get_health(struct ndctl_dimm *dimm)
+{
+	struct ndctl_cmd *cmd = NULL;
+	unsigned int health;
+	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
+	const char *devname = ndctl_dimm_get_devname(dimm);
+
+	cmd = ndctl_dimm_cmd_new_smart(dimm);
+	if (!cmd) {
+		err(ctx, "%s: no smart command support\n", devname);
+		return UINT_MAX;
+	}
+	if (ndctl_cmd_submit(cmd)) {
+		err(ctx, "%s: smart command failed\n", devname);
+		ndctl_cmd_unref(cmd);
+		return UINT_MAX;
+	}
+
+	health = ndctl_cmd_smart_get_health(cmd);
+	ndctl_cmd_unref(cmd);
+	return health;
+}
+
+NDCTL_EXPORT unsigned int ndctl_dimm_get_flags(struct ndctl_dimm *dimm)
+{
+	struct ndctl_cmd *cmd = NULL;
+	unsigned int flags;
+	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
+	const char *devname = ndctl_dimm_get_devname(dimm);
+
+	cmd = ndctl_dimm_cmd_new_smart(dimm);
+	if (!cmd) {
+		dbg(ctx, "%s: no smart command support\n", devname);
+		return UINT_MAX;
+	}
+	if (ndctl_cmd_submit(cmd)) {
+		dbg(ctx, "%s: smart command failed\n", devname);
+		ndctl_cmd_unref(cmd);
+		return UINT_MAX;
+	}
+
+	flags = ndctl_cmd_smart_get_flags(cmd);
+	ndctl_cmd_unref(cmd);
+	return flags;
+}
+
+NDCTL_EXPORT int ndctl_dimm_is_flag_supported(struct ndctl_dimm *dimm,
+		unsigned int flag)
+{
+	unsigned int flags = ndctl_dimm_get_flags(dimm);
+	return (flags ==  UINT_MAX) ? 0 : !!(flags & flag);
+}
+
+NDCTL_EXPORT unsigned int ndctl_dimm_get_event_flags(struct ndctl_dimm *dimm)
+{
+	struct ndctl_cmd *cmd = NULL;
+	unsigned int alarm_flags, event_flags = 0;
+	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
+	const char *devname = ndctl_dimm_get_devname(dimm);
+
+	cmd = ndctl_dimm_cmd_new_smart(dimm);
+	if (!cmd) {
+		err(ctx, "%s: no smart command support\n", devname);
+		return UINT_MAX;
+	}
+	if (ndctl_cmd_submit(cmd)) {
+		err(ctx, "%s: smart command failed\n", devname);
+		ndctl_cmd_unref(cmd);
+		return UINT_MAX;
+	}
+
+	alarm_flags = ndctl_cmd_smart_get_alarm_flags(cmd);
+	if (alarm_flags & ND_SMART_SPARE_TRIP)
+		event_flags |= ND_EVENT_SPARES_REMAINING;
+	if (alarm_flags & ND_SMART_MTEMP_TRIP)
+		event_flags |= ND_EVENT_MEDIA_TEMPERATURE;
+	if (alarm_flags & ND_SMART_CTEMP_TRIP)
+		event_flags |= ND_EVENT_CTRL_TEMPERATURE;
+	if (ndctl_cmd_smart_get_shutdown_state(cmd))
+		event_flags |= ND_EVENT_UNCLEAN_SHUTDOWN;
+
+	ndctl_cmd_unref(cmd);
+	return event_flags;
 }
 
 NDCTL_EXPORT unsigned int ndctl_dimm_handle_get_node(struct ndctl_dimm *dimm)
@@ -1460,11 +1748,6 @@ NDCTL_EXPORT unsigned int ndctl_dimm_handle_get_dimm(struct ndctl_dimm *dimm)
 NDCTL_EXPORT struct ndctl_bus *ndctl_dimm_get_bus(struct ndctl_dimm *dimm)
 {
 	return dimm->bus;
-}
-
-NDCTL_EXPORT struct ndctl_smart_ops *ndctl_dimm_get_smart_ops(struct ndctl_dimm *dimm)
-{
-	return dimm->smart_ops;
 }
 
 NDCTL_EXPORT struct ndctl_ctx *ndctl_dimm_get_ctx(struct ndctl_dimm *dimm)
@@ -1630,6 +1913,18 @@ static int region_set_type(struct ndctl_region *region, char *path)
 	return 0;
 }
 
+static enum ndctl_persistence_domain region_get_pd_type(char *name)
+{
+	if (strncmp("cpu_cache", name, 9) == 0)
+		return PERSISTENCE_CPU_CACHE;
+	else if (strncmp("memory_controller", name, 17) == 0)
+		return PERSISTENCE_MEM_CTRL;
+	else if (strncmp("none", name, 4) == 0)
+		return PERSISTENCE_NONE;
+	else
+		return PERSISTENCE_UNKNOWN;
+}
+
 static void *add_region(void *parent, int id, const char *region_base)
 {
 	char buf[SYSFS_ATTR_SIZE];
@@ -1637,6 +1932,7 @@ static void *add_region(void *parent, int id, const char *region_base)
 	struct ndctl_bus *bus = parent;
 	struct ndctl_ctx *ctx = bus->ctx;
 	char *path = calloc(1, strlen(region_base) + 100);
+	int perm;
 
 	if (!path)
 		return NULL;
@@ -1685,6 +1981,12 @@ static void *add_region(void *parent, int id, const char *region_base)
 		goto err_read;
 	region->module = to_module(ctx, buf);
 
+	sprintf(path, "%s/numa_node", region_base);
+	if (sysfs_read_attr(ctx, path, buf) == 0)
+		region->numa_node = strtol(buf, NULL, 0);
+	else
+		region->numa_node = -1;
+
 	if (region_set_type(region, path) < 0)
 		goto err_read;
 
@@ -1699,6 +2001,31 @@ static void *add_region(void *parent, int id, const char *region_base)
 
 	list_add(&bus->regions, &region->list);
 
+	/* get the persistence domain attrib */
+	sprintf(path, "%s/persistence_domain", region_base);
+	if (sysfs_read_attr(ctx, path, buf) < 0)
+		region->persistence_domain = PERSISTENCE_UNKNOWN;
+	else
+		region->persistence_domain = region_get_pd_type(buf);
+
+	sprintf(path, "%s/deep_flush", region_base);
+	region->flush_fd = open(path, O_RDWR | O_CLOEXEC);
+	if (region->flush_fd == -1)
+		goto out;
+
+	if (pread(region->flush_fd, buf, 1, 0) == -1) {
+		close(region->flush_fd);
+		region->flush_fd = -1;
+		goto out;
+	}
+
+	perm = strtol(buf, NULL, 0);
+	if (perm == 0) {
+		close(region->flush_fd);
+		region->flush_fd = -1;
+	}
+
+ out:
 	free(path);
 	return region;
 
@@ -1783,6 +2110,39 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_available_size(
 	return strtoull(buf, NULL, 0);
 }
 
+NDCTL_EXPORT unsigned long long ndctl_region_get_max_available_extent(
+		struct ndctl_region *region)
+{
+	unsigned int nstype = ndctl_region_get_nstype(region);
+	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
+	char *path = region->region_buf;
+	int len = region->buf_len;
+	char buf[SYSFS_ATTR_SIZE];
+
+	switch (nstype) {
+	case ND_DEVICE_NAMESPACE_PMEM:
+	case ND_DEVICE_NAMESPACE_BLK:
+		break;
+	default:
+		return 0;
+	}
+
+	if (snprintf(path, len,
+		     "%s/max_available_extent", region->region_path) >= len) {
+		err(ctx, "%s: buffer too small!\n",
+				ndctl_region_get_devname(region));
+		return ULLONG_MAX;
+	}
+
+	/* fall back to legacy behavior if max extents is not exported */
+	if (sysfs_read_attr(ctx, path, buf) < 0) {
+		dbg(ctx, "max extents attribute not exported on older kernels\n");
+		return ULLONG_MAX;
+	}
+
+	return strtoull(buf, NULL, 0);
+}
+
 NDCTL_EXPORT unsigned int ndctl_region_get_range_index(struct ndctl_region *region)
 {
 	return region->range_index;
@@ -1838,9 +2198,7 @@ static const char *ndctl_device_type_name(int type)
 	case ND_DEVICE_NAMESPACE_IO:   return "namespace_io";
 	case ND_DEVICE_NAMESPACE_PMEM: return "namespace_pmem";
 	case ND_DEVICE_NAMESPACE_BLK:  return "namespace_blk";
-#ifdef HAVE_NDCTL_DEVICE_DAX
 	case ND_DEVICE_DAX_PMEM:       return "dax_pmem";
-#endif
 	default:                       return "unknown";
 	}
 }
@@ -1888,6 +2246,11 @@ NDCTL_EXPORT struct ndctl_dimm *ndctl_region_get_next_dimm(struct ndctl_region *
 	}
 
 	return NULL;
+}
+
+NDCTL_EXPORT int ndctl_region_get_numa_node(struct ndctl_region *region)
+{
+	return region->numa_node;
 }
 
 static int regions_badblocks_init(struct ndctl_region *region)
@@ -1957,6 +2320,12 @@ NDCTL_EXPORT struct badblock *ndctl_region_get_first_badblock(struct ndctl_regio
 		return NULL;
 
 	return ndctl_region_get_next_badblock(region);
+}
+
+NDCTL_EXPORT enum ndctl_persistence_domain
+ndctl_region_get_persistence_domain(struct ndctl_region *region)
+{
+	return region->persistence_domain;
 }
 
 static struct nd_cmd_vendor_tail *to_vendor_tail(struct ndctl_cmd *cmd)
@@ -2254,23 +2623,17 @@ static int to_ioctl_cmd(int cmd, int dimm)
 {
 	if (!dimm) {
 		switch (cmd) {
-#ifdef HAVE_NDCTL_ARS
 		case ND_CMD_ARS_CAP:         return ND_IOCTL_ARS_CAP;
 		case ND_CMD_ARS_START:       return ND_IOCTL_ARS_START;
 		case ND_CMD_ARS_STATUS:      return ND_IOCTL_ARS_STATUS;
-#endif
-#ifdef HAVE_NDCTL_CLEAR_ERROR
 		case ND_CMD_CLEAR_ERROR:     return ND_IOCTL_CLEAR_ERROR;
-#endif
 		case ND_CMD_CALL:            return ND_IOCTL_CALL;
 		default:
-						       return 0;
+					     return 0;
 		};
 	}
 
 	switch (cmd) {
-	case ND_CMD_SMART:                  return ND_IOCTL_SMART;
-	case ND_CMD_SMART_THRESHOLD:        return ND_IOCTL_SMART_THRESHOLD;
 	case ND_CMD_DIMM_FLAGS:             return ND_IOCTL_DIMM_FLAGS;
 	case ND_CMD_GET_CONFIG_SIZE:        return ND_IOCTL_GET_CONFIG_SIZE;
 	case ND_CMD_GET_CONFIG_DATA:        return ND_IOCTL_GET_CONFIG_DATA;
@@ -2280,30 +2643,43 @@ static int to_ioctl_cmd(int cmd, int dimm)
 	case ND_CMD_VENDOR_EFFECT_LOG_SIZE:
 	case ND_CMD_VENDOR_EFFECT_LOG:
 	default:
-					      return 0;
+					    return 0;
 	}
+}
+
+static const char *ndctl_dimm_get_cmd_subname(struct ndctl_cmd *cmd)
+{
+	struct ndctl_dimm *dimm = cmd->dimm;
+	struct ndctl_dimm_ops *ops = dimm ? dimm->ops : NULL;
+
+	if (!dimm || cmd->type != ND_CMD_CALL || !ops || !ops->cmd_desc)
+		return NULL;
+	return ops->cmd_desc(cmd->pkg->nd_command);
 }
 
 static int do_cmd(int fd, int ioctl_cmd, struct ndctl_cmd *cmd)
 {
 	int rc;
 	u32 offset;
-	const char *name;
+	const char *name, *sub_name = NULL;
+	struct ndctl_dimm *dimm = cmd->dimm;
 	struct ndctl_bus *bus = cmd_to_bus(cmd);
 	struct ndctl_cmd_iter *iter = &cmd->iter;
 	struct ndctl_ctx *ctx = ndctl_bus_get_ctx(bus);
 
-	if (cmd->dimm)
-		name = ndctl_dimm_get_cmd_name(cmd->dimm, cmd->type);
-	else
+	if (dimm) {
+		name = ndctl_dimm_get_cmd_name(dimm, cmd->type);
+		sub_name = ndctl_dimm_get_cmd_subname(cmd);
+	} else
 		name = ndctl_bus_get_cmd_name(cmd->bus, cmd->type);
+
 
 	if (iter->total_xfer == 0) {
 		rc = ioctl(fd, ioctl_cmd, cmd->cmd_buf);
-		dbg(ctx, "bus: %d dimm: %#x cmd: %s status: %d fw: %d (%s)\n",
-				bus->id, cmd->dimm
-				? ndctl_dimm_get_handle(cmd->dimm) : 0,
-				name, rc, *(cmd->firmware_status), rc < 0 ?
+		dbg(ctx, "bus: %d dimm: %#x cmd: %s%s%s status: %d fw: %d (%s)\n",
+				bus->id, dimm ? ndctl_dimm_get_handle(dimm) : 0,
+				name, sub_name ? ":" : "", sub_name ? sub_name : "",
+				rc, *(cmd->firmware_status), rc < 0 ?
 				strerror(errno) : "success");
 		if (rc < 0)
 			return -errno;
@@ -2333,10 +2709,10 @@ static int do_cmd(int fd, int ioctl_cmd, struct ndctl_cmd *cmd)
 		}
 	}
 
-	dbg(ctx, "bus: %d dimm: %#x cmd: %s total: %d max_xfer: %d status: %d fw: %d (%s)\n",
-			bus->id,
-			cmd->dimm ? ndctl_dimm_get_handle(cmd->dimm) : 0,
-			name, iter->total_xfer, iter->max_xfer, rc,
+	dbg(ctx, "bus: %d dimm: %#x cmd: %s%s%s total: %d max_xfer: %d status: %d fw: %d (%s)\n",
+			bus->id, dimm ? ndctl_dimm_get_handle(dimm) : 0,
+			name, sub_name ? ":" : "", sub_name ? sub_name : "",
+			iter->total_xfer, iter->max_xfer, rc,
 			*(cmd->firmware_status),
 			rc < 0 ? strerror(errno) : "success");
 
@@ -2393,6 +2769,8 @@ NDCTL_EXPORT int ndctl_cmd_submit(struct ndctl_cmd *cmd)
 	close(fd);
  out:
 	cmd->status = rc;
+	if (rc && cmd->handle_error)
+		rc = cmd->handle_error(cmd);
 	return rc;
 }
 
@@ -2854,6 +3232,7 @@ static void *add_namespace(void *parent, int id, const char *ndns_base)
 	ndns->id = id;
 	ndns->region = region;
 	ndns->generation = region->generation;
+	list_head_init(&ndns->injected_bb);
 
 	sprintf(path, "%s/nstype", ndns_base);
 	if (sysfs_read_attr(ctx, path, buf) < 0)
@@ -2879,6 +3258,8 @@ static void *add_namespace(void *parent, int id, const char *ndns_base)
 	sprintf(path, "%s/numa_node", ndns_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
 		ndns->numa_node = strtol(buf, NULL, 0);
+	else
+		ndns->numa_node = -1;
 
 	sprintf(path, "%s/holder_class", ndns_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
@@ -3730,6 +4111,82 @@ NDCTL_EXPORT int ndctl_namespace_set_size(struct ndctl_namespace *ndns,
 NDCTL_EXPORT int ndctl_namespace_get_numa_node(struct ndctl_namespace *ndns)
 {
     return ndns->numa_node;
+}
+
+static int __ndctl_namespace_set_write_cache(struct ndctl_namespace *ndns,
+		int state)
+{
+	struct ndctl_ctx *ctx = ndctl_namespace_get_ctx(ndns);
+	struct ndctl_pfn *pfn = ndctl_namespace_get_pfn(ndns);
+	char *path = ndns->ndns_buf;
+	char buf[SYSFS_ATTR_SIZE];
+	int len = ndns->buf_len;
+	const char *bdev;
+
+	if (state != 1 && state != 0)
+		return -ENXIO;
+	if (pfn)
+		bdev = ndctl_pfn_get_block_device(pfn);
+	else
+		bdev = ndctl_namespace_get_block_device(ndns);
+
+	if (!bdev)
+		return -ENXIO;
+
+	if (snprintf(path, len, "/sys/block/%s/dax/write_cache", bdev) >= len) {
+		err(ctx, "%s: buffer too small!\n",
+				ndctl_namespace_get_devname(ndns));
+		return -ENXIO;
+	}
+
+	sprintf(buf, "%d\n", state);
+	return sysfs_write_attr(ctx, path, buf);
+}
+
+NDCTL_EXPORT int ndctl_namespace_enable_write_cache(
+		struct ndctl_namespace *ndns)
+{
+	return __ndctl_namespace_set_write_cache(ndns, 1);
+}
+
+NDCTL_EXPORT int ndctl_namespace_disable_write_cache(
+		struct ndctl_namespace *ndns)
+{
+	return __ndctl_namespace_set_write_cache(ndns, 0);
+}
+
+NDCTL_EXPORT int ndctl_namespace_write_cache_is_enabled(
+		struct ndctl_namespace *ndns)
+{
+	struct ndctl_ctx *ctx = ndctl_namespace_get_ctx(ndns);
+	struct ndctl_pfn *pfn = ndctl_namespace_get_pfn(ndns);
+	int len = ndns->buf_len, wc;
+	char *path = ndns->ndns_buf;
+	char buf[SYSFS_ATTR_SIZE];
+	const char *bdev;
+
+	if (pfn)
+		bdev = ndctl_pfn_get_block_device(pfn);
+	else
+		bdev = ndctl_namespace_get_block_device(ndns);
+
+	if (!bdev)
+		return -ENXIO;
+
+	if (snprintf(path, len, "/sys/block/%s/dax/write_cache", bdev) >= len) {
+		err(ctx, "%s: buffer too small!\n",
+				ndctl_namespace_get_devname(ndns));
+		return -ENXIO;
+	}
+
+	if (sysfs_read_attr(ctx, path, buf) < 0)
+		return -ENXIO;
+
+	if (sscanf(buf, "%d", &wc) == 1)
+		if (wc)
+			return 1;
+
+	return 0;
 }
 
 NDCTL_EXPORT int ndctl_namespace_delete(struct ndctl_namespace *ndns)

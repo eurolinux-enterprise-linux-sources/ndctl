@@ -23,14 +23,12 @@
 #include <uuid/uuid.h>
 #include <ccan/list/list.h>
 #include <ccan/array_size/array_size.h>
-#ifdef HAVE_NDCTL_H
-#include <linux/ndctl.h>
-#else
+
 #include <ndctl.h>
-#endif
 #include <ndctl/libndctl.h>
 #include <ccan/endian/endian.h>
 #include <ccan/short_types/short_types.h>
+#include "intel.h"
 #include "hpe1.h"
 #include "msft.h"
 
@@ -63,7 +61,7 @@ struct nvdimm_data {
 struct ndctl_dimm {
 	struct kmod_module *module;
 	struct ndctl_bus *bus;
-	struct ndctl_smart_ops *smart_ops;
+	struct ndctl_dimm_ops *ops;
 	struct nvdimm_data ndd;
 	unsigned int handle, major, minor, serial;
 	unsigned short phys_id;
@@ -75,8 +73,9 @@ struct ndctl_dimm {
 	unsigned short subsystem_revision_id;
 	unsigned short manufacturing_date;
 	unsigned char manufacturing_location;
-	unsigned long dsm_family;
-	unsigned long dsm_mask;
+	unsigned long cmd_family;
+	unsigned long cmd_mask;
+	unsigned long nfit_dsm_mask;
 	char *unique_id;
 	char *dimm_path;
 	char *dimm_buf;
@@ -95,10 +94,27 @@ struct ndctl_dimm {
 			unsigned int f_notify:1;
 		};
 	} flags;
+	int locked;
+	int aliased;
 	struct list_node list;
 	int formats;
 	int format[0];
 };
+
+enum dsm_support {
+	DIMM_DSM_UNSUPPORTED, /* don't attempt command */
+	DIMM_DSM_SUPPORTED, /* good to go */
+	DIMM_DSM_UNKNOWN, /* try ND_CMD_CALL on older kernels */
+};
+
+static inline enum dsm_support test_dimm_dsm(struct ndctl_dimm *dimm, int fn)
+{
+	if (dimm->nfit_dsm_mask == ULONG_MAX) {
+		return DIMM_DSM_UNKNOWN;
+	} else if (dimm->nfit_dsm_mask & (1 << fn))
+		return DIMM_DSM_SUPPORTED;
+	return DIMM_DSM_UNSUPPORTED;
+}
 
 void region_flag_refresh(struct ndctl_region *region);
 
@@ -152,8 +168,52 @@ struct ndctl_bus {
 	char *bus_buf;
 	size_t buf_len;
 	char *wait_probe_path;
-	unsigned long dsm_mask;
+	char *scrub_path;
+	unsigned long cmd_mask;
 	unsigned long nfit_dsm_mask;
+};
+
+/**
+ * struct ndctl_lbasize - lbasize info for btt and blk-namespace devices
+ * @select: currently selected sector_size
+ * @supported: possible sector_size options
+ * @num: number of entries in @supported
+ */
+struct ndctl_lbasize {
+	int select;
+	unsigned int *supported;
+	int num;
+};
+
+/**
+ * struct ndctl_namespace - device claimed by the nd_blk or nd_pmem driver
+ * @module: kernel module
+ * @type: integer nd-bus device-type
+ * @type_name: 'namespace_io', 'namespace_pmem', or 'namespace_block'
+ * @namespace_path: devpath for namespace device
+ * @bdev: associated block_device of a namespace
+ * @size: unsigned
+ * @numa_node: numa node attribute
+ *
+ * A 'namespace' is the resulting device after region-aliasing and
+ * label-parsing is resolved.
+ */
+struct ndctl_namespace {
+	struct kmod_module *module;
+	struct ndctl_region *region;
+	struct list_node list;
+	char *ndns_path;
+	char *ndns_buf;
+	char *bdev;
+	int type, id, buf_len, raw_mode;
+	int generation;
+	unsigned long long resource, size;
+	enum ndctl_namespace_mode enforce_mode;
+	char *alt_name;
+	uuid_t uuid;
+	struct ndctl_lbasize lbasize;
+	int numa_node;
+	struct list_head injected_bb;
 };
 
 /**
@@ -167,6 +227,8 @@ struct ndctl_bus {
  * @firmware_status: NFIT command output status code
  * @iter: iterator for multi-xfer commands
  * @source: source cmd of an inherited iter.total_buf
+ * @handle_error: function pointer to handle a cmd error and override it to
+ * 		  return alternative data (from a cache for example).
  *
  * For dynamically sized commands like 'get_config', 'set_config', or
  * 'vendor', @size encompasses the entire buffer for the command input
@@ -195,19 +257,16 @@ struct ndctl_cmd {
 		int dir;
 	} iter;
 	struct ndctl_cmd *source;
+	int (*handle_error)(struct ndctl_cmd *cmd);
 	union {
-#ifdef HAVE_NDCTL_ARS
 		struct nd_cmd_ars_cap ars_cap[0];
 		struct nd_cmd_ars_start ars_start[0];
 		struct nd_cmd_ars_status ars_status[0];
-#endif
-#ifdef HAVE_NDCTL_CLEAR_ERROR
 		struct nd_cmd_clear_error clear_err[0];
-#endif
+		struct nd_cmd_pkg pkg[0];
 		struct ndn_pkg_hpe1 hpe1[0];
 		struct ndn_pkg_msft msft[0];
-		struct nd_cmd_smart smart[0];
-		struct nd_cmd_smart_threshold smart_t[0];
+		struct nd_pkg_intel intel[0];
 		struct nd_cmd_get_config_size get_size[0];
 		struct nd_cmd_get_config_data_hdr get_data[0];
 		struct nd_cmd_set_config_hdr set_data[0];
@@ -216,47 +275,70 @@ struct ndctl_cmd {
 	};
 };
 
-struct ndctl_smart_ops {
+struct ndctl_bb {
+	u64 block;
+	u64 count;
+	struct list_node list;
+};
+
+/* ars_status flags */
+#define ND_ARS_STAT_FLAG_OVERFLOW (1 << 0)
+
+struct ndctl_dimm_ops {
+	const char *(*cmd_desc)(int);
 	struct ndctl_cmd *(*new_smart)(struct ndctl_dimm *);
 	unsigned int (*smart_get_flags)(struct ndctl_cmd *);
 	unsigned int (*smart_get_health)(struct ndctl_cmd *);
-	unsigned int (*smart_get_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_get_media_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_get_ctrl_temperature)(struct ndctl_cmd *);
 	unsigned int (*smart_get_spares)(struct ndctl_cmd *);
 	unsigned int (*smart_get_alarm_flags)(struct ndctl_cmd *);
 	unsigned int (*smart_get_life_used)(struct ndctl_cmd *);
 	unsigned int (*smart_get_shutdown_state)(struct ndctl_cmd *);
+	unsigned int (*smart_get_shutdown_count)(struct ndctl_cmd *);
 	unsigned int (*smart_get_vendor_size)(struct ndctl_cmd *);
 	unsigned char *(*smart_get_vendor_data)(struct ndctl_cmd *);
 	struct ndctl_cmd *(*new_smart_threshold)(struct ndctl_dimm *);
 	unsigned int (*smart_threshold_get_alarm_control)(struct ndctl_cmd *);
-	unsigned int (*smart_threshold_get_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_threshold_get_media_temperature)(struct ndctl_cmd *);
+	unsigned int (*smart_threshold_get_ctrl_temperature)(struct ndctl_cmd *);
 	unsigned int (*smart_threshold_get_spares)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_smart_set_threshold)(struct ndctl_cmd *);
+	unsigned int (*smart_threshold_get_supported_alarms)(struct ndctl_cmd *);
+	int (*smart_threshold_set_alarm_control)(struct ndctl_cmd *, unsigned int);
+	int (*smart_threshold_set_media_temperature)(struct ndctl_cmd *, unsigned int);
+	int (*smart_threshold_set_ctrl_temperature)(struct ndctl_cmd *, unsigned int);
+	int (*smart_threshold_set_spares)(struct ndctl_cmd *, unsigned int);
+	struct ndctl_cmd *(*new_smart_inject)(struct ndctl_dimm *);
+	int (*smart_inject_media_temperature)(struct ndctl_cmd *, bool, unsigned int);
+	int (*smart_inject_ctrl_temperature)(struct ndctl_cmd *, bool, unsigned int);
+	int (*smart_inject_spares)(struct ndctl_cmd *, bool, unsigned int);
+	int (*smart_inject_fatal)(struct ndctl_cmd *, bool);
+	int (*smart_inject_unsafe_shutdown)(struct ndctl_cmd *, bool);
+	int (*smart_inject_supported)(struct ndctl_dimm *);
+	struct ndctl_cmd *(*new_fw_get_info)(struct ndctl_dimm *);
+	unsigned int (*fw_info_get_storage_size)(struct ndctl_cmd *);
+	unsigned int (*fw_info_get_max_send_len)(struct ndctl_cmd *);
+	unsigned int (*fw_info_get_query_interval)(struct ndctl_cmd *);
+	unsigned int (*fw_info_get_max_query_time)(struct ndctl_cmd *);
+	unsigned long long (*fw_info_get_run_version)(struct ndctl_cmd *);
+	unsigned long long (*fw_info_get_updated_version)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_fw_start_update)(struct ndctl_dimm *);
+	unsigned int (*fw_start_get_context)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_fw_send)(struct ndctl_cmd *,
+			unsigned int, unsigned int, void *);
+	struct ndctl_cmd *(*new_fw_finish)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_fw_abort)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_fw_finish_query)(struct ndctl_cmd *);
+	unsigned long long (*fw_fquery_get_fw_rev)(struct ndctl_cmd *);
+	enum ND_FW_STATUS (*fw_xlat_firmware_status)(struct ndctl_cmd *);
+	struct ndctl_cmd *(*new_ack_shutdown_count)(struct ndctl_dimm *);
+	int (*fw_update_supported)(struct ndctl_dimm *);
 };
 
-#if HAS_SMART == 1
-struct ndctl_smart_ops * const intel_smart_ops;
-struct ndctl_smart_ops * const hpe1_smart_ops;
-struct ndctl_smart_ops * const msft_smart_ops;
-#else
-static struct ndctl_smart_ops * const intel_smart_ops = NULL;
-static struct ndctl_smart_ops * const hpe1_smart_ops = NULL;
-static struct ndctl_smart_ops * const msft_smart_ops = NULL;
-#endif
-
-/* internal library helpers for conditionally defined command numbers */
-#ifdef HAVE_NDCTL_ARS
-static const int nd_cmd_ars_status = ND_CMD_ARS_STATUS;
-static const int nd_cmd_ars_cap = ND_CMD_ARS_CAP;
-#else
-static const int nd_cmd_ars_status;
-static const int nd_cmd_ars_cap;
-#endif
-
-#ifdef HAVE_NDCTL_CLEAR_ERROR
-static const int nd_cmd_clear_error = ND_CMD_CLEAR_ERROR;
-#else
-static const int nd_cmd_clear_error;
-#endif
+struct ndctl_dimm_ops * const intel_dimm_ops;
+struct ndctl_dimm_ops * const hpe1_dimm_ops;
+struct ndctl_dimm_ops * const msft_dimm_ops;
 
 static inline struct ndctl_bus *cmd_to_bus(struct ndctl_cmd *cmd)
 {
@@ -279,5 +361,9 @@ static inline int check_kmod(struct kmod_ctx *kmod_ctx)
 
 int ndctl_bus_nfit_translate_spa(struct ndctl_bus *bus, unsigned long long addr,
 		unsigned int *handle, unsigned long long *dpa);
+struct ndctl_cmd *ndctl_bus_cmd_new_err_inj(struct ndctl_bus *bus);
+struct ndctl_cmd *ndctl_bus_cmd_new_err_inj_clr(struct ndctl_bus *bus);
+struct ndctl_cmd *ndctl_bus_cmd_new_err_inj_stat(struct ndctl_bus *bus,
+	u32 buf_size);
 
 #endif /* _LIBNDCTL_PRIVATE_H_ */

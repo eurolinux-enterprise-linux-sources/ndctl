@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 ndctl-list(1)
 =============
 
@@ -21,10 +23,9 @@ ndctl list --namespaces --bus=all --region=all
 
 EXAMPLE
 -------
-[verse]
+----
 # ndctl list --buses --namespaces
 
-["literal"]
 {
   "provider":"nfit_test.1",
   "dev":"ndbus2",
@@ -47,12 +48,13 @@ EXAMPLE
   "namespaces":[
     {
       "dev":"namespace0.0",
-      "mode":"memory",
+      "mode":"fsdax",
       "size":8589934592,
       "blockdev":"pmem0"
     }
   ]
 }
+----
 
 OPTIONS
 -------
@@ -62,11 +64,13 @@ include::xable-region-options.txt[]
 
 -d::
 --dimm=::
-	An 'nmemX' device name, or dimm id number. Filter listing by
-	devices that reference the given dimm. For example to see all
-	namespaces comprised of storage capacity on nmem0:
-[verse]
+	An 'nmemX' device name, or dimm id number. The dimm id number
+	here is X in 'nmemX'. Filter listing by devices that reference
+	the given dimm. For example to see all namespaces comprised
+	of storage capacity on nmem0:
+----
 # ndctl list --dimm=nmem0 --namespaces
+----
 
 -n::
 --namespace=::
@@ -80,8 +84,12 @@ include::xable-region-options.txt[]
 
 -m::
 --mode=::
-	Filter listing by the mode ('raw', 'memory', 'sector' or 'dax')
+	Filter listing by the mode ('raw', 'fsdax', 'sector' or 'devdax')
 	of the namespace(s).
+
+-U::
+--numa-node=::
+	Filter listing by numa node
 
 -B::
 --buses::
@@ -110,14 +118,27 @@ include::xable-region-options.txt[]
   }
 }
 
+-F::
+--firmware::
+	Include dimm firmware info in the listing. For example:
+[verse]
+{
+  "dev":"nmem0",
+  "firmware":{
+      "current_version":0,
+      "next_version":1,
+      "need_powercycle":true
+  }
+}
+
 -X::
 --device-dax::
 	Include device-dax ("daxregion") details when a namespace is in
-	"dax" mode.
+	"devdax" mode.
 [verse]
 {
   "dev":"namespace0.0",
-  "mode":"dax",
+  "mode":"devdax",
   "size":4225761280,
   "uuid":"18ae1bbb-bb62-4efc-86df-4a5caacb5dcc",
   "daxregion":{
@@ -180,14 +201,23 @@ include::xable-region-options.txt[]
   ]
 }
 
--u::
---human::
-	By default 'ndctl list' will output machine-friendly raw-integer
-	data. Instead, with this flag, numbers representing storage size
-	will be formatted as human readable strings with units, other
-	fields are converted to hexadecimal strings.  Example:
+-v::
+--verbose::
+	Increase verbosity of the output. This can be specified
+	multiple times to be even more verbose on the informational and
+	miscellaneous output, and can be used to override omitted flags
+	for showing specific information. +
+*-v*
+In addition to the enabled namespaces default output, show the numa_node,
+raw_uuid, and bad block media errors. +
+*-vv*
+Everything '-v' provides, plus automatically enable --dimms, --buses, and --regions. +
+*-vvv*
+Everything '-vv' provides, plus --health, --idle, and --firmware.
 
-[verse]
+include::human-option.txt[]
+
+----
 # ndctl list --region=7
 {
   "dev":"region7",
@@ -197,7 +227,9 @@ include::xable-region-options.txt[]
   "iset_id":-6382611090938810793,
   "badblock_count":8
 }
+----
 
+----
 # ndctl list --human --region=7
 {
   "dev":"region7",
@@ -207,13 +239,9 @@ include::xable-region-options.txt[]
   "iset_id":"0xa76c6907811fae57",
   "badblock_count":8
 }
+----
 
-COPYRIGHT
----------
-Copyright (c) 2016 - 2017, Intel Corporation. License GPLv2: GNU GPL
-version 2 <http://gnu.org/licenses/gpl.html>.  This is free software:
-you are free to change and redistribute it.  There is NO WARRANTY, to
-the extent permitted by law.
+include::../copyright.txt[]
 
 SEE ALSO
 --------

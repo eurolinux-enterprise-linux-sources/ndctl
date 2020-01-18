@@ -24,7 +24,12 @@ TESTS =\
 	rescan-partitions.sh \
 	inject-smart.sh \
 	monitor.sh \
-	max_available_extent_ns.sh
+	max_available_extent_ns.sh \
+	pfn-meta-errors.sh
+
+if ENABLE_KEYUTILS
+TESTS += security.sh
+endif
 
 check_PROGRAMS =\
 	libndctl \
@@ -162,4 +167,5 @@ list_smart_dimm_SOURCES = \
 list_smart_dimm_LDADD = \
 		$(LIBNDCTL_LIB) \
 		$(JSON_LIBS) \
+		$(UUID_LIBS) \
 		../libutil.a

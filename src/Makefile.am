@@ -42,8 +42,9 @@ bashcompletiondir = $(BASH_COMPLETION_DIR)
 dist_bashcompletion_DATA = contrib/ndctl
 endif
 
-udevrulesdir = $(UDEVDIR)/rules.d
-dist_udevrules_DATA = contrib/80-ndctl.rules
+modprobe_file = contrib/nvdimm-security.conf
+modprobedir = $(sysconfdir)/modprobe.d/
+modprobe_DATA = $(modprobe_file)
 
 noinst_LIBRARIES = libccan.a
 libccan_a_SOURCES = \

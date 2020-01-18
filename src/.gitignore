@@ -18,14 +18,15 @@ Documentation/ndctl/asciidoc.conf
 Documentation/daxctl/asciidoctor-extensions.rb
 Documentation/ndctl/asciidoctor-extensions.rb
 .dirstamp
+daxctl/config.h
 daxctl/daxctl
 daxctl/lib/libdaxctl.la
 daxctl/lib/libdaxctl.lo
 daxctl/lib/libdaxctl.pc
 *.a
+ndctl/config.h
 ndctl/lib/libndctl.pc
 ndctl/ndctl
-ndctl/ndctl-udev
 rhel/
 sles/ndctl.spec
 util/log.lo

@@ -47,9 +47,24 @@ man1_MANS = \
 	ndctl-inject-smart.1 \
 	ndctl-update-firmware.1 \
 	ndctl-list.1 \
-	ndctl-monitor.1
+	ndctl-monitor.1 \
+	ndctl-setup-passphrase.1 \
+	ndctl-update-passphrase.1 \
+	ndctl-remove-passphrase.1 \
+	ndctl-freeze-security.1 \
+	ndctl-sanitize-dimm.1 \
+	ndctl-load-keys.1 \
+	ndctl-wait-overwrite.1
 
 CLEANFILES = $(man1_MANS)
+
+.ONESHELL:
+attrs.adoc: $(srcdir)/Makefile.am
+	$(AM_V_GEN) cat <<- EOF >$@
+		:ndctl_monitorconfdir: $(ndctl_monitorconfdir)
+		:ndctl_monitorconf: $(ndctl_monitorconf)
+		:ndctl_keysdir: $(ndctl_keysdir)
+		EOF
 
 XML_DEPS = \
 	../../version.m4 \
@@ -63,7 +78,8 @@ XML_DEPS = \
 	xable-namespace-options.txt \
 	ars-description.txt \
 	labels-description.txt \
-	labels-options.txt
+	labels-options.txt \
+	attrs.adoc
 
 RM ?= rm -f
 

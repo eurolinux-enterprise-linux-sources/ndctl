@@ -1,11 +1,14 @@
 Name:		ndctl
-Version:	62
-Release:	1%{?dist}
+Version:	64.1
+Release:	2%{?dist}
 Summary:	Manage "libnvdimm" subsystem devices (Non-volatile Memory)
 License:	GPLv2
 Group:		System Environment/Base
 Url:		https://github.com/pmem/ndctl
 Source0:	https://github.com/pmem/%{name}/archive/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source1:	dracut-nvdimm-security.conf
+
+Patch0:		ndctl-64-disable-asciidoctor.patch
 
 Requires:	ndctl-libs%{?_isa} = %{version}-%{release}
 Requires:	daxctl-libs%{?_isa} = %{version}-%{release}
@@ -20,7 +23,8 @@ BuildRequires:	pkgconfig(libudev)
 BuildRequires:	pkgconfig(uuid)
 BuildRequires:	pkgconfig(json-c)
 BuildRequires:	pkgconfig(bash-completion)
-BuildRequires:	systemd
+BuildRequires:	pkgconfig(systemd)
+BuildRequires:	keyutils-libs-devel
 
 %description
 Utility library for managing the "libnvdimm" subsystem.  The "libnvdimm"
@@ -87,6 +91,7 @@ control API for these devices.
 
 %prep
 %setup -q ndctl-%{version}
+%patch0 -p1
 chmod +x test/monitor.sh
 
 %build
@@ -98,6 +103,7 @@ make %{?_smp_mflags}
 %install
 %make_install
 find $RPM_BUILD_ROOT -name '*.la' -exec rm -f {} ';'
+install -Dp -m 0644 %{SOURCE1} $RPM_BUILD_ROOT/%{_sysconfdir}/dracut.conf.d/nvdimm-security.conf
 
 %check
 # There are x86-isms in the unit tests
@@ -115,22 +121,24 @@ make check
 %postun -n daxctl-libs -p /sbin/ldconfig
 
 %define bashcompdir %(pkg-config --variable=completionsdir bash-completion)
-%define udevdir %(pkg-config --variable=udevdir udev)
 
 %files
 %license util/COPYING licenses/BSD-MIT licenses/CC0
 %{_bindir}/ndctl
 %{_mandir}/man1/ndctl*
 %{bashcompdir}/
-%{_sysconfdir}/ndctl/monitor.conf
 %{_unitdir}/ndctl-monitor.service
-%{_udevrulesdir}/80-ndctl.rules
-%{udevdir}/ndctl-udev
+%{_sysconfdir}/ndctl/keys/keys.readme
+%{_sysconfdir}/modprobe.d/nvdimm-security.conf
+%{_sysconfdir}/dracut.conf.d/nvdimm-security.conf
+
+%config(noreplace) %{_sysconfdir}/ndctl/monitor.conf
 
 %files -n daxctl
 %license util/COPYING licenses/BSD-MIT licenses/CC0
 %{_bindir}/daxctl
 %{_mandir}/man1/daxctl*
+%{_datadir}/daxctl/daxctl.conf
 
 %files -n ndctl-libs
 %doc README.md
@@ -156,6 +164,16 @@ make check
 
 
 %changelog
+* Wed Mar 27 2019 Jeff Moyer <jmoyer@redhat.com> - 64.1-2
+- Fix initramfs creating by forcing installation of libnvdimm.ko
+- Related: bz#1634348
+
+* Fri Mar 22 2019 Jeff Moyer <jmoyer@redhat.com> - 64.1-1
+- Rebase to v64.1 (Jeff Moyer)
+  - add security commands
+  - fix broken udev rule for dirty shutdown count
+- Resolves: bz#1634348 bz#1635441
+
 * Thu Aug 23 2018 Jeff Moyer <jmoyer@redhat.com> - 62-1
 - Rebase to v62 (Jeff Moyer)
   - a new monitor command / daemon

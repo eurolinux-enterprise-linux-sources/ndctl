@@ -31,6 +31,7 @@
 #include <ccan/build_assert/build_assert.h>
 
 #include <ndctl.h>
+#include <util/size.h>
 #include <util/sysfs.h>
 #include <ndctl/libndctl.h>
 #include <ndctl/namespace.h>
@@ -178,8 +179,7 @@ struct ndctl_region {
 		int state;
 		unsigned long long cookie;
 	} iset;
-	FILE *badblocks;
-	struct badblock bb;
+	struct badblocks_iter bb_iter;
 	enum ndctl_persistence_domain persistence_domain;
 	/* file descriptor for deep flush sysfs entry */
 	int flush_fd;
@@ -238,6 +238,7 @@ struct ndctl_pfn {
 	int buf_len;
 	uuid_t uuid;
 	int id, generation;
+	struct ndctl_lbasize alignments;
 };
 
 struct ndctl_dax {
@@ -376,6 +377,77 @@ NDCTL_EXPORT struct ndctl_ctx *ndctl_ref(struct ndctl_ctx *ctx)
 	return ctx;
 }
 
+static void badblocks_iter_free(struct badblocks_iter *bb_iter)
+{
+	if (bb_iter->file)
+		fclose(bb_iter->file);
+}
+
+static int badblocks_iter_init(struct badblocks_iter *bb_iter, const char *path)
+{
+	char *bb_path;
+	int rc = 0;
+
+	/* if the file is already open */
+	if (bb_iter->file) {
+		fclose(bb_iter->file);
+		bb_iter->file = NULL;
+	}
+
+	if (asprintf(&bb_path, "%s/badblocks", path) < 0)
+		return -errno;
+
+	bb_iter->file = fopen(bb_path, "re");
+	if (!bb_iter->file) {
+		rc = -errno;
+		free(bb_path);
+		return rc;
+	}
+
+	free(bb_path);
+	return rc;
+}
+
+static struct badblock *badblocks_iter_next(struct badblocks_iter *bb_iter)
+{
+	int rc;
+	char *buf = NULL;
+	size_t rlen = 0;
+
+	if (!bb_iter->file)
+		return NULL;
+
+	rc = getline(&buf, &rlen, bb_iter->file);
+	if (rc == -1) {
+		free(buf);
+		return NULL;
+	}
+
+	rc = sscanf(buf, "%llu %u", &bb_iter->bb.offset, &bb_iter->bb.len);
+	free(buf);
+	if (rc != 2) {
+		fclose(bb_iter->file);
+		bb_iter->file = NULL;
+		bb_iter->bb.offset = 0;
+		bb_iter->bb.len = 0;
+		return NULL;
+	}
+
+	return &bb_iter->bb;
+}
+
+static struct badblock *badblocks_iter_first(struct badblocks_iter *bb_iter,
+		struct ndctl_ctx *ctx, const char *path)
+{
+	int rc;
+
+	rc = badblocks_iter_init(bb_iter, path);
+	if (rc < 0)
+		return NULL;
+
+	return badblocks_iter_next(bb_iter);
+}
+
 static void free_namespace(struct ndctl_namespace *ndns, struct list_head *head)
 {
 	struct ndctl_bb *bb, *next;
@@ -389,6 +461,7 @@ static void free_namespace(struct ndctl_namespace *ndns, struct list_head *head)
 	free(ndns->ndns_buf);
 	free(ndns->bdev);
 	free(ndns->alt_name);
+	badblocks_iter_free(&ndns->bb_iter);
 	kmod_module_unref(ndns->module);
 	free(ndns);
 }
@@ -511,8 +584,7 @@ static void free_region(struct ndctl_region *region)
 	kmod_module_unref(region->module);
 	free(region->region_buf);
 	free(region->region_path);
-	if (region->badblocks)
-		fclose(region->badblocks);
+	badblocks_iter_free(&region->bb_iter);
 	if (region->flush_fd > 0)
 		close(region->flush_fd);
 	free(region);
@@ -1043,12 +1115,15 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_resource(struct ndctl_region *r
 	if (snprintf(path, len, "%s/resource", region->region_path) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				ndctl_region_get_devname(region));
+		errno = ENOMEM;
 		return ULLONG_MAX;
 	}
 
 	rc = sysfs_read_attr(ctx, path, buf);
-	if (rc < 0)
+	if (rc < 0) {
+		errno = -rc;
 		return ULLONG_MAX;
+	}
 
 	return strtoull(buf, NULL, 0);
 }
@@ -1187,9 +1262,13 @@ NDCTL_EXPORT unsigned int ndctl_bus_get_scrub_count(struct ndctl_bus *bus)
 {
 	unsigned int scrub_count = 0;
 	bool active = false;
+	int rc;
 
-	if (__ndctl_bus_get_scrub_state(bus, &scrub_count, &active))
+	rc = __ndctl_bus_get_scrub_state(bus, &scrub_count, &active);
+	if (rc) {
+		errno = -rc;
 		return UINT_MAX;
+	}
 	return scrub_count;
 }
 
@@ -1322,6 +1401,7 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 	dimm->device_id = -1;
 	dimm->revision_id = -1;
 	dimm->health_eventfd = -1;
+	dimm->dirty_shutdown = -ENOENT;
 	dimm->subsystem_vendor_id = -1;
 	dimm->subsystem_device_id = -1;
 	dimm->subsystem_revision_id = -1;
@@ -1386,6 +1466,10 @@ static void *add_dimm(void *parent, int id, const char *dimm_base)
 	sprintf(path, "%s/nfit/rev_id", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
 		dimm->revision_id = strtoul(buf, NULL, 0);
+
+	sprintf(path, "%s/nfit/dirty_shutdown", dimm_base);
+	if (sysfs_read_attr(ctx, path, buf) == 0)
+		dimm->dirty_shutdown = strtoll(buf, NULL, 0);
 
 	sprintf(path, "%s/nfit/subsystem_vendor", dimm_base);
 	if (sysfs_read_attr(ctx, path, buf) == 0)
@@ -1487,6 +1571,11 @@ NDCTL_EXPORT unsigned short ndctl_dimm_get_device(struct ndctl_dimm *dimm)
 NDCTL_EXPORT unsigned short ndctl_dimm_get_revision(struct ndctl_dimm *dimm)
 {
 	return dimm->revision_id;
+}
+
+NDCTL_EXPORT long long ndctl_dimm_get_dirty_shutdown(struct ndctl_dimm *dimm)
+{
+	return dimm->dirty_shutdown;
 }
 
 NDCTL_EXPORT unsigned short ndctl_dimm_get_subsystem_vendor(
@@ -1641,15 +1730,19 @@ NDCTL_EXPORT unsigned int ndctl_dimm_get_health(struct ndctl_dimm *dimm)
 	unsigned int health;
 	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
 	const char *devname = ndctl_dimm_get_devname(dimm);
+	int rc;
 
 	cmd = ndctl_dimm_cmd_new_smart(dimm);
 	if (!cmd) {
 		err(ctx, "%s: no smart command support\n", devname);
 		return UINT_MAX;
 	}
-	if (ndctl_cmd_submit(cmd)) {
+	rc = ndctl_cmd_submit(cmd);
+	if (rc) {
 		err(ctx, "%s: smart command failed\n", devname);
 		ndctl_cmd_unref(cmd);
+		if (rc < 0)
+			errno = -rc;
 		return UINT_MAX;
 	}
 
@@ -1664,15 +1757,19 @@ NDCTL_EXPORT unsigned int ndctl_dimm_get_flags(struct ndctl_dimm *dimm)
 	unsigned int flags;
 	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
 	const char *devname = ndctl_dimm_get_devname(dimm);
+	int rc;
 
 	cmd = ndctl_dimm_cmd_new_smart(dimm);
 	if (!cmd) {
 		dbg(ctx, "%s: no smart command support\n", devname);
 		return UINT_MAX;
 	}
-	if (ndctl_cmd_submit(cmd)) {
+	rc = ndctl_cmd_submit(cmd);
+	if (rc) {
 		dbg(ctx, "%s: smart command failed\n", devname);
 		ndctl_cmd_unref(cmd);
+		if (rc < 0)
+			errno = -rc;
 		return UINT_MAX;
 	}
 
@@ -1690,6 +1787,7 @@ NDCTL_EXPORT int ndctl_dimm_is_flag_supported(struct ndctl_dimm *dimm,
 
 NDCTL_EXPORT unsigned int ndctl_dimm_get_event_flags(struct ndctl_dimm *dimm)
 {
+	int rc;
 	struct ndctl_cmd *cmd = NULL;
 	unsigned int alarm_flags, event_flags = 0;
 	struct ndctl_ctx *ctx = ndctl_dimm_get_ctx(dimm);
@@ -1700,9 +1798,12 @@ NDCTL_EXPORT unsigned int ndctl_dimm_get_event_flags(struct ndctl_dimm *dimm)
 		err(ctx, "%s: no smart command support\n", devname);
 		return UINT_MAX;
 	}
-	if (ndctl_cmd_submit(cmd)) {
+	rc = ndctl_cmd_submit(cmd);
+	if (rc) {
 		err(ctx, "%s: smart command failed\n", devname);
 		ndctl_cmd_unref(cmd);
+		if (rc < 0)
+			errno = -rc;
 		return UINT_MAX;
 	}
 
@@ -2087,7 +2188,7 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_available_size(
 	unsigned int nstype = ndctl_region_get_nstype(region);
 	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
 	char *path = region->region_buf;
-	int len = region->buf_len;
+	int rc, len = region->buf_len;
 	char buf[SYSFS_ATTR_SIZE];
 
 	switch (nstype) {
@@ -2101,11 +2202,15 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_available_size(
 	if (snprintf(path, len, "%s/available_size", region->region_path) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				ndctl_region_get_devname(region));
+		errno = ENOMEM;
 		return ULLONG_MAX;
 	}
 
-	if (sysfs_read_attr(ctx, path, buf) < 0)
+	rc = sysfs_read_attr(ctx, path, buf);
+	if (rc < 0) {
+		errno = -rc;
 		return ULLONG_MAX;
+	}
 
 	return strtoull(buf, NULL, 0);
 }
@@ -2116,7 +2221,7 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_max_available_extent(
 	unsigned int nstype = ndctl_region_get_nstype(region);
 	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
 	char *path = region->region_buf;
-	int len = region->buf_len;
+	int rc, len = region->buf_len;
 	char buf[SYSFS_ATTR_SIZE];
 
 	switch (nstype) {
@@ -2131,12 +2236,15 @@ NDCTL_EXPORT unsigned long long ndctl_region_get_max_available_extent(
 		     "%s/max_available_extent", region->region_path) >= len) {
 		err(ctx, "%s: buffer too small!\n",
 				ndctl_region_get_devname(region));
+		errno = ENOMEM;
 		return ULLONG_MAX;
 	}
 
 	/* fall back to legacy behavior if max extents is not exported */
-	if (sysfs_read_attr(ctx, path, buf) < 0) {
+	rc = sysfs_read_attr(ctx, path, buf);
+	if (rc < 0) {
 		dbg(ctx, "max extents attribute not exported on older kernels\n");
+		errno = -rc;
 		return ULLONG_MAX;
 	}
 
@@ -2253,73 +2361,15 @@ NDCTL_EXPORT int ndctl_region_get_numa_node(struct ndctl_region *region)
 	return region->numa_node;
 }
 
-static int regions_badblocks_init(struct ndctl_region *region)
-{
-	struct ndctl_ctx *ctx = ndctl_region_get_ctx(region);
-	char *bb_path;
-	int rc = 0;
-
-	/* if the file is already open */
-	if (region->badblocks) {
-		fclose(region->badblocks);
-		region->badblocks = NULL;
-	}
-
-	if (asprintf(&bb_path, "%s/badblocks",
-				region->region_path) < 0) {
-		rc = -errno;
-		err(ctx, "region badblocks path allocation failure\n");
-		return rc;
-	}
-
-	region->badblocks = fopen(bb_path, "re");
-	if (!region->badblocks) {
-		rc = -errno;
-		free(bb_path);
-		return rc;
-	}
-
-	free(bb_path);
-	return rc;
-}
-
 NDCTL_EXPORT struct badblock *ndctl_region_get_next_badblock(struct ndctl_region *region)
 {
-	int rc;
-	char *buf = NULL;
-	size_t rlen = 0;
-
-	if (!region->badblocks)
-		return NULL;
-
-	rc = getline(&buf, &rlen, region->badblocks);
-	if (rc == -1) {
-		free(buf);
-		return NULL;
-	}
-
-	rc = sscanf(buf, "%llu %u", &region->bb.offset, &region->bb.len);
-	free(buf);
-	if (rc != 2) {
-		fclose(region->badblocks);
-		region->badblocks = NULL;
-		region->bb.offset = 0;
-		region->bb.len = 0;
-		return NULL;
-	}
-
-	return &region->bb;
+	return badblocks_iter_next(&region->bb_iter);
 }
 
 NDCTL_EXPORT struct badblock *ndctl_region_get_first_badblock(struct ndctl_region *region)
 {
-	int rc;
-
-	rc = regions_badblocks_init(region);
-	if (rc < 0)
-		return NULL;
-
-	return ndctl_region_get_next_badblock(region);
+	return badblocks_iter_first(&region->bb_iter,
+			ndctl_region_get_ctx(region), region->region_path);
 }
 
 NDCTL_EXPORT enum ndctl_persistence_domain
@@ -2657,6 +2707,16 @@ static const char *ndctl_dimm_get_cmd_subname(struct ndctl_cmd *cmd)
 	return ops->cmd_desc(cmd->pkg->nd_command);
 }
 
+NDCTL_EXPORT int ndctl_cmd_xlat_firmware_status(struct ndctl_cmd *cmd)
+{
+	struct ndctl_dimm *dimm = cmd->dimm;
+	struct ndctl_dimm_ops *ops = dimm ? dimm->ops : NULL;
+
+	if (!dimm || !ops || !ops->xlat_firmware_status)
+		return 0;
+	return ops->xlat_firmware_status(cmd);
+}
+
 static int do_cmd(int fd, int ioctl_cmd, struct ndctl_cmd *cmd)
 {
 	int rc;
@@ -2769,9 +2829,25 @@ NDCTL_EXPORT int ndctl_cmd_submit(struct ndctl_cmd *cmd)
 	close(fd);
  out:
 	cmd->status = rc;
-	if (rc && cmd->handle_error)
-		rc = cmd->handle_error(cmd);
 	return rc;
+}
+
+NDCTL_EXPORT int ndctl_cmd_submit_xlat(struct ndctl_cmd *cmd)
+{
+	int rc, xlat_rc;
+
+	rc = ndctl_cmd_submit(cmd);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * NOTE: This can lose a positive rc when xlat_rc is non-zero. The
+	 * positive rc indicates a buffer underrun from the original command
+	 * submission. If the caller cares about that (generally not very
+	 * useful), then the xlat function is available separately as well.
+	 */
+	xlat_rc = ndctl_cmd_xlat_firmware_status(cmd);
+	return (xlat_rc == 0) ? rc : xlat_rc;
 }
 
 NDCTL_EXPORT int ndctl_cmd_get_status(struct ndctl_cmd *cmd)
@@ -3597,6 +3673,48 @@ NDCTL_EXPORT int ndctl_namespace_is_enabled(struct ndctl_namespace *ndns)
 	return is_enabled(ndctl_namespace_get_bus(ndns), path);
 }
 
+NDCTL_EXPORT struct badblock *ndctl_namespace_get_next_badblock(
+		struct ndctl_namespace *ndns)
+{
+	return badblocks_iter_next(&ndns->bb_iter);
+}
+
+NDCTL_EXPORT struct badblock *ndctl_namespace_get_first_badblock(
+		struct ndctl_namespace *ndns)
+{
+	struct ndctl_btt *btt = ndctl_namespace_get_btt(ndns);
+	struct ndctl_pfn *pfn = ndctl_namespace_get_pfn(ndns);
+	struct ndctl_dax *dax = ndctl_namespace_get_dax(ndns);
+	struct ndctl_ctx *ctx = ndctl_namespace_get_ctx(ndns);
+	const char *dev = ndctl_namespace_get_devname(ndns);
+	char path[SYSFS_ATTR_SIZE];
+	ssize_t len = sizeof(path);
+	const char *bdev;
+
+	if (btt || dax) {
+		dbg(ctx, "%s: badblocks not supported for %s\n", dev,
+				btt ? "btt" : "device-dax");
+		return NULL;
+	}
+
+	if (pfn)
+		bdev = ndctl_pfn_get_block_device(pfn);
+	else
+		bdev = ndctl_namespace_get_block_device(ndns);
+
+	if (!bdev) {
+		dbg(ctx, "%s: failed to determine block device\n", dev);
+		return NULL;
+	}
+
+	if (snprintf(path, len, "/sys/block/%s", bdev) >= len) {
+		err(ctx, "%s: buffer too small!\n", dev);
+		return NULL;
+	}
+
+	return badblocks_iter_first(&ndns->bb_iter, ctx, path);
+}
+
 static int ndctl_bind(struct ndctl_ctx *ctx, struct kmod_module *module,
 		const char *devname)
 {
@@ -3956,9 +4074,10 @@ NDCTL_EXPORT unsigned int ndctl_namespace_get_supported_sector_size(
 	if (ndns->lbasize.num == 0)
 		return 0;
 
-	if (i < 0 || i > ndns->lbasize.num)
+	if (i < 0 || i > ndns->lbasize.num) {
+		errno = EINVAL;
 		return UINT_MAX;
-	else
+	} else
 		return ndns->lbasize.supported[i];
 }
 
@@ -4215,7 +4334,12 @@ NDCTL_EXPORT int ndctl_namespace_delete(struct ndctl_namespace *ndns)
 	}
 
 	rc = namespace_set_size(ndns, 0);
-	if (rc)
+	/*
+	 * if the namespace has already been deleted, this will return
+	 * -ENXIO due to the uuid check in __size_store. We can safely
+	 *  ignore it in the case of writing a zero.
+	 */
+	if (rc && (rc != -ENXIO))
 		return rc;
 
 	region->namespaces_init = 0;
@@ -4367,9 +4491,10 @@ NDCTL_EXPORT unsigned int ndctl_btt_get_id(struct ndctl_btt *btt)
 NDCTL_EXPORT unsigned int ndctl_btt_get_supported_sector_size(
 		struct ndctl_btt *btt, int i)
 {
-	if (i < 0 || i > btt->lbasize.num)
+	if (i < 0 || i > btt->lbasize.num) {
+		errno = EINVAL;
 		return UINT_MAX;
-	else
+	} else
 		return btt->lbasize.supported[i];
 }
 
@@ -4692,6 +4817,19 @@ static void *__add_pfn(struct ndctl_pfn *pfn, const char *pfn_base)
 	else
 		pfn->size = strtoull(buf, NULL, 0);
 
+	/*
+	 * The supported_alignments attribute was added before arches other
+	 * than x86 had pmem support. If the kernel doesn't provide the
+	 * attribute then it's safe to assume that we running on x86 where
+	 * 4KiB and 2MiB have always been supported.
+	 */
+	sprintf(path, "%s/supported_alignments", pfn_base);
+	if (sysfs_read_attr(ctx, path, buf) < 0)
+		sprintf(buf, "%d %d", SZ_4K, SZ_2M);
+
+	if (parse_lbasize_supported(ctx, pfn_base, buf, &pfn->alignments) < 0)
+		goto err_read;
+
 	free(path);
 	return pfn;
 
@@ -4926,6 +5064,23 @@ NDCTL_EXPORT int ndctl_pfn_set_align(struct ndctl_pfn *pfn, unsigned long align)
 	return 0;
 }
 
+NDCTL_EXPORT int ndctl_pfn_get_num_alignments(struct ndctl_pfn *pfn)
+{
+	return pfn->alignments.num;
+}
+
+NDCTL_EXPORT unsigned long ndctl_pfn_get_supported_alignment(
+		struct ndctl_pfn *pfn, int i)
+{
+	if (pfn->alignments.num == 0)
+		return 0;
+
+	if (i < 0 || i > pfn->alignments.num)
+		return -EINVAL;
+	else
+		return pfn->alignments.supported[i];
+}
+
 NDCTL_EXPORT int ndctl_pfn_set_namespace(struct ndctl_pfn *pfn,
 		struct ndctl_namespace *ndns)
 {
@@ -5146,6 +5301,17 @@ NDCTL_EXPORT int ndctl_dax_set_location(struct ndctl_dax *dax,
 NDCTL_EXPORT unsigned long ndctl_dax_get_align(struct ndctl_dax *dax)
 {
 	return ndctl_pfn_get_align(&dax->pfn);
+}
+
+NDCTL_EXPORT int ndctl_dax_get_num_alignments(struct ndctl_dax *dax)
+{
+	return ndctl_pfn_get_num_alignments(&dax->pfn);
+}
+
+NDCTL_EXPORT unsigned long ndctl_dax_get_supported_alignment(
+		struct ndctl_dax *dax, int i)
+{
+	return ndctl_pfn_get_supported_alignment(&dax->pfn, i);
 }
 
 NDCTL_EXPORT int ndctl_dax_has_align(struct ndctl_dax *dax)

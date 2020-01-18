@@ -76,6 +76,7 @@ struct ndctl_dimm {
 	unsigned long cmd_family;
 	unsigned long cmd_mask;
 	unsigned long nfit_dsm_mask;
+	long long dirty_shutdown;
 	char *unique_id;
 	char *dimm_path;
 	char *dimm_buf;
@@ -185,6 +186,11 @@ struct ndctl_lbasize {
 	int num;
 };
 
+struct badblocks_iter {
+	struct badblock bb;
+	FILE *file;
+};
+
 /**
  * struct ndctl_namespace - device claimed by the nd_blk or nd_pmem driver
  * @module: kernel module
@@ -209,6 +215,7 @@ struct ndctl_namespace {
 	int generation;
 	unsigned long long resource, size;
 	enum ndctl_namespace_mode enforce_mode;
+	struct badblocks_iter bb_iter;
 	char *alt_name;
 	uuid_t uuid;
 	struct ndctl_lbasize lbasize;
@@ -227,8 +234,6 @@ struct ndctl_namespace {
  * @firmware_status: NFIT command output status code
  * @iter: iterator for multi-xfer commands
  * @source: source cmd of an inherited iter.total_buf
- * @handle_error: function pointer to handle a cmd error and override it to
- * 		  return alternative data (from a cache for example).
  *
  * For dynamically sized commands like 'get_config', 'set_config', or
  * 'vendor', @size encompasses the entire buffer for the command input
@@ -257,7 +262,6 @@ struct ndctl_cmd {
 		int dir;
 	} iter;
 	struct ndctl_cmd *source;
-	int (*handle_error)(struct ndctl_cmd *cmd);
 	union {
 		struct nd_cmd_ars_cap ars_cap[0];
 		struct nd_cmd_ars_start ars_start[0];
@@ -334,6 +338,7 @@ struct ndctl_dimm_ops {
 	enum ND_FW_STATUS (*fw_xlat_firmware_status)(struct ndctl_cmd *);
 	struct ndctl_cmd *(*new_ack_shutdown_count)(struct ndctl_dimm *);
 	int (*fw_update_supported)(struct ndctl_dimm *);
+	int (*xlat_firmware_status)(struct ndctl_cmd *);
 };
 
 struct ndctl_dimm_ops * const intel_dimm_ops;

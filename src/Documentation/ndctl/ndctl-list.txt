@@ -98,6 +98,14 @@ include::xable-region-options.txt[]
 -D::
 --dimms::
 	Include dimm info in the listing
+[verse]
+{
+  "dev":"nmem0",
+  "id":"cdab-0a-07e0-ffffffff",
+  "handle":0,
+  "phys_id":0,
+  "security:":"disabled"
+}
 
 -H::
 --health::
@@ -207,13 +215,14 @@ include::xable-region-options.txt[]
 	multiple times to be even more verbose on the informational and
 	miscellaneous output, and can be used to override omitted flags
 	for showing specific information. +
-*-v*
-In addition to the enabled namespaces default output, show the numa_node,
-raw_uuid, and bad block media errors. +
-*-vv*
-Everything '-v' provides, plus automatically enable --dimms, --buses, and --regions. +
-*-vvv*
-Everything '-vv' provides, plus --health, --idle, and --firmware.
+	- *-v*
+	  In addition to the enabled namespaces default output, show the
+	  numa_node, raw_uuid, and bad block media errors. +
+	- *-vv*
+	  Everything '-v' provides, plus automatically enable --dimms,
+	  --buses, and --regions. +
+	- *-vvv*
+	  Everything '-vv' provides, plus --health, --idle, and --firmware.
 
 include::human-option.txt[]
 

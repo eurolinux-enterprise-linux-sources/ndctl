@@ -16,6 +16,54 @@
 #include <ndctl/libndctl.h>
 #include "private.h"
 
+static int intel_cmd_xlat_firmware_status(struct ndctl_cmd *cmd)
+{
+	struct nd_pkg_intel *pkg = cmd->intel;
+	unsigned int status, ext_status;
+
+	status = (*cmd->firmware_status) & ND_INTEL_STATUS_MASK;
+	ext_status = (*cmd->firmware_status) & ND_INTEL_STATUS_EXTEND_MASK;
+
+	/* Common statuses */
+	switch (status) {
+	case ND_INTEL_STATUS_SUCCESS:
+		return 0;
+	case ND_INTEL_STATUS_NOTSUPP:
+		return -EOPNOTSUPP;
+	case ND_INTEL_STATUS_NOTEXIST:
+		return -ENXIO;
+	case ND_INTEL_STATUS_INVALPARM:
+		return -EINVAL;
+	case ND_INTEL_STATUS_HWERR:
+		return -EIO;
+	case ND_INTEL_STATUS_RETRY:
+		return -EAGAIN;
+	case ND_INTEL_STATUS_EXTEND:
+		/* refer to extended status, break out of this */
+		break;
+	case ND_INTEL_STATUS_NORES:
+		return -EAGAIN;
+	case ND_INTEL_STATUS_NOTREADY:
+		return -EBUSY;
+	}
+
+	/* Extended status is command specific */
+	switch (pkg->gen.nd_command) {
+	case ND_INTEL_SMART:
+	case ND_INTEL_SMART_THRESHOLD:
+	case ND_INTEL_SMART_SET_THRESHOLD:
+		/* ext status not specified */
+		break;
+	case ND_INTEL_SMART_INJECT:
+		/* smart injection not enabled */
+		if (ext_status == ND_INTEL_STATUS_INJ_DISABLED)
+			return -ENXIO;
+		break;
+	}
+
+	return -ENOMSG;
+}
+
 static struct ndctl_cmd *alloc_intel_cmd(struct ndctl_dimm *dimm,
 		unsigned func, size_t in_size, size_t out_size)
 {
@@ -56,41 +104,6 @@ static struct ndctl_cmd *alloc_intel_cmd(struct ndctl_dimm *dimm,
 	return cmd;
 }
 
-/*
- * If provided, read the cached shutdown count in case the user does not have
- * access rights to run the smart command, and pretend the command was
- * successful with only the shutdown_count valid.
- */
-static int intel_smart_handle_error(struct ndctl_cmd *cmd)
-{
-	struct ndctl_dimm *dimm = cmd->dimm;
-	char *path = NULL, shutdown_count[16] = {};
-	int fd, rc = cmd->status;
-
-	if (!dimm)
-		return 0;
-
-	if (asprintf(&path, DEF_TMPFS_DIR "/%s/usc",
-		     ndctl_dimm_get_devname(dimm)) < 0)
-		return rc;
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		goto free_path;
-
-	if (read(fd, shutdown_count, sizeof(shutdown_count)) < 0)
-		goto close;
-
-	cmd->intel->smart.flags = ND_INTEL_SMART_SHUTDOWN_COUNT_VALID;
-	cmd->intel->smart.shutdown_count = strtoull(shutdown_count, NULL, 0);
-	rc = cmd->status = 0;
- close:
-	close (fd);
- free_path:
-	free(path);
-	return rc;
-}
-
 static struct ndctl_cmd *intel_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
 {
 	struct ndctl_cmd *cmd;
@@ -102,7 +115,6 @@ static struct ndctl_cmd *intel_dimm_cmd_new_smart(struct ndctl_dimm *dimm)
 	if (!cmd)
 		return NULL;
 	cmd->firmware_status = &cmd->intel->smart.status;
-	cmd->handle_error = intel_smart_handle_error;
 
 	return cmd;
 }
@@ -121,8 +133,12 @@ static int intel_smart_valid(struct ndctl_cmd *cmd)
 #define intel_smart_get_field(cmd, field) \
 static unsigned int intel_cmd_smart_get_##field(struct ndctl_cmd *cmd) \
 { \
-	if (intel_smart_valid(cmd) < 0) \
+	int rc; \
+	rc = intel_smart_valid(cmd); \
+	if (rc < 0) { \
+		errno = -rc; \
 		return UINT_MAX; \
+	} \
 	return cmd->intel->smart.field; \
 }
 
@@ -209,8 +225,12 @@ static int intel_smart_threshold_valid(struct ndctl_cmd *cmd)
 static unsigned int intel_cmd_smart_threshold_get_##field( \
 			struct ndctl_cmd *cmd) \
 { \
-	if (intel_smart_threshold_valid(cmd) < 0) \
+	int rc; \
+	rc = intel_smart_threshold_valid(cmd); \
+	if (rc < 0) { \
+		errno = -rc; \
 		return UINT_MAX; \
+	} \
 	return cmd->intel->thresh.field; \
 }
 
@@ -467,8 +487,12 @@ static int intel_fw_get_info_valid(struct ndctl_cmd *cmd)
 static unsigned int intel_cmd_fw_info_get_##field( \
 			struct ndctl_cmd *cmd) \
 { \
-	if (intel_fw_get_info_valid(cmd) < 0) \
+	int rc; \
+	rc = intel_fw_get_info_valid(cmd); \
+	if (rc < 0) { \
+		errno = -rc; \
 		return UINT_MAX; \
+	} \
 	return cmd->intel->info.field; \
 }
 
@@ -476,8 +500,12 @@ static unsigned int intel_cmd_fw_info_get_##field( \
 static unsigned long long intel_cmd_fw_info_get_##field( \
 			struct ndctl_cmd *cmd) \
 { \
-	if (intel_fw_get_info_valid(cmd) < 0) \
+	int rc; \
+	rc = intel_fw_get_info_valid(cmd); \
+	if (rc < 0) { \
+		errno = -rc; \
 		return ULLONG_MAX; \
+	} \
 	return cmd->intel->info.field; \
 }
 
@@ -490,8 +518,13 @@ intel_fw_info_get_field64(cmd, run_version);
 static unsigned long long intel_cmd_fw_info_get_updated_version(
 		struct ndctl_cmd *cmd)
 {
-	if (intel_fw_get_info_valid(cmd) < 0)
+	int rc;
+
+	rc = intel_fw_get_info_valid(cmd);
+	if (rc < 0) {
+		errno = -rc;
 		return ULLONG_MAX;
+	}
 	return cmd->intel->info.updated_version;
 
 }
@@ -524,8 +557,13 @@ static int intel_fw_start_valid(struct ndctl_cmd *cmd)
 
 static unsigned int intel_cmd_fw_start_get_context(struct ndctl_cmd *cmd)
 {
-	if (intel_fw_start_valid(cmd) < 0)
+	int rc;
+
+	rc = intel_fw_start_valid(cmd);
+	if (rc < 0) {
+		errno = -rc;
 		return UINT_MAX;
+	}
 	return cmd->intel->start.context;
 }
 
@@ -616,8 +654,13 @@ static int intel_fw_fquery_valid(struct ndctl_cmd *cmd)
 static unsigned long long
 intel_cmd_fw_fquery_get_fw_rev(struct ndctl_cmd *cmd)
 {
-	if (intel_fw_fquery_valid(cmd) < 0)
+	int rc;
+
+	rc = intel_fw_fquery_valid(cmd);
+	if (rc < 0) {
+		errno = -rc;
 		return ULLONG_MAX;
+	}
 	return cmd->intel->fquery.updated_fw_rev;
 }
 
@@ -785,4 +828,5 @@ struct ndctl_dimm_ops * const intel_dimm_ops = &(struct ndctl_dimm_ops) {
 	.fw_xlat_firmware_status = intel_cmd_fw_xlat_firmware_status,
 	.new_ack_shutdown_count = intel_dimm_cmd_new_lss,
 	.fw_update_supported = intel_dimm_fw_update_supported,
+	.xlat_firmware_status = intel_cmd_xlat_firmware_status,
 };
